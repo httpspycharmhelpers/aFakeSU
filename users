@@ -1,0 +1,28 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# users - 显示本机真实用户/用户名列表 (rish uid 2000 实时查询)
+D="$(cd "$(dirname "$0")" && pwd)"
+
+echo "== 系统用户 (pm list users) =="
+"$D/rishq" 'pm list users'
+echo
+echo "== 真实应用 uid / 用户名 (pm list packages -U) =="
+"$D/rishq" 'pm list packages -U' | grep '^package:' | while IFS= read -r line; do
+    name="${line%% *}"
+    name="${name#package:}"
+    uids="${line#* uid:}"
+    OIFS=$IFS
+    IFS=','
+    for u in $uids; do
+        IFS=$OIFS
+        [ -n "$u" ] || continue
+        user=$((u / 100000))
+        app=$((u % 100000))
+        if [ "$app" -ge 10000 ]; then
+            uname="u${user}_a$((app - 10000))"
+        else
+            uname="AID-$app"
+        fi
+        printf '%-10s %-14s %s\n' "$u" "$uname" "$name"
+    done
+    IFS=$OIFS
+done | sort -n -u

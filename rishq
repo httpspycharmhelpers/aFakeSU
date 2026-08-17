@@ -1,0 +1,67 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# rishq - 经 rish 执行设备命令 (UID 2000 shell 身份)
+# 一次调用 = 一次 rish 会话 (coproc 匿名管道), 无 fifo -> shell 域 SELinux 可用
+# 会话冷启动 (app_process/ART) ~15s; su 侧已把多次查询合并为一次调用
+#
+# 用法: rishq '<设备端命令>' [看门狗秒数]
+#
+set -u
+
+D="$(cd "$(dirname "$0")" && pwd)"
+CMD="$1"
+WD="${2:-30}"
+MARK="__AFS_${BASHPID}_$$__"
+
+# 看门狗: 后台 sleep, 超时则杀会话使 read 得 EOF
+wp=""
+wp2=""
+arm_wd() {
+    local w="$1"
+    sleep "$w" &
+    wp=$!
+    ( wait "$wp" 2>/dev/null && kill -9 "$copid" 2>/dev/null ) &
+    wp2=$!
+}
+disarm_wd() {
+    [ -z "$wp" ] || kill "$wp" 2>/dev/null
+    [ -z "$wp" ] || wait "$wp" 2>/dev/null
+    [ -z "$wp2" ] || wait "$wp2" 2>/dev/null
+}
+# 读直到出现标记 (含标记前累积输出)
+read_until() {
+    local mark="$1" line out=""
+    while IFS= read -r -u "${RISH[0]}" line; do
+        case "$line" in
+            *"$mark"*) printf '%s' "$out"; return 0 ;;
+            *) out+="$line"$'\n' ;;
+        esac
+    done
+    return 1
+}
+
+attempt=$((1))
+while [ "$attempt" -le 3 ]; do
+    coproc RISH { exec sh "$D/rish" -cil 2>&1; }
+    copid=$RISH_PID
+    wp=""; wp2=""
+    local_wd=$WD
+    [ "$attempt" -eq 1 ] && local_wd=$((WD + 20))
+    # 就绪握手
+    arm_wd "$local_wd"
+    printf 'echo %s\n' "${MARK}H" >&"${RISH[1]}" 2>/dev/null || { disarm_wd; kill -9 "$copid" 2>/dev/null; wait "$copid" 2>/dev/null; attempt=$((attempt + 1)); continue; }
+    read_until "${MARK}H" || { disarm_wd; kill -9 "$copid" 2>/dev/null; wait "$copid" 2>/dev/null; attempt=$((attempt + 1)); continue; }
+    # 真实命令
+    printf '%s; echo %s\n' "$CMD" "$MARK" >&"${RISH[1]}" 2>/dev/null || { disarm_wd; kill -9 "$copid" 2>/dev/null; wait "$copid" 2>/dev/null; attempt=$((attempt + 1)); continue; }
+    if out=$(read_until "$MARK"); then
+        disarm_wd
+        kill -9 "$copid" 2>/dev/null
+        wait "$copid" 2>/dev/null
+        printf '%s' "$out"
+        exit 0
+    fi
+    disarm_wd
+    kill -9 "$copid" 2>/dev/null
+    wait "$copid" 2>/dev/null
+    attempt=$((attempt + 1))
+done
+exit 1
