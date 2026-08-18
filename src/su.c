@@ -22,7 +22,7 @@
 extern const unsigned char _binary_bash_bin_start[];
 extern const unsigned char _binary_bash_bin_end[];
 #define EMBEDDED_BASH_SIZE ((size_t)(_binary_bash_bin_end - _binary_bash_bin_start))
-#define VERSION_STR "2c6adbc6:MAGISKSU"
+#define VERSION_STR "2c6adbc6:AFAKESU"
 #define VERSION_CODE "27000"
 #define DEFAULT_SHELL "/system/bin/sh"
 #define ANDROID_PATH "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin"
@@ -51,9 +51,9 @@ static long g_gid = -1;
 static void print_help(FILE *f)
 {
 	fprintf(f,
-		"MagiskSU\n"
+		"FakeSU\n"
 		"\n"
-		"Usage: su [options] [-] [user [argument...]]\n"
+		"Usage: fakesu [options] [-] [user [argument...]]\n"
 		"\n"
 		"Options:\n"
 		"  -c, --command COMMAND         Pass COMMAND to the invoked shell\n"
