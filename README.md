@@ -11,8 +11,8 @@ aFakeSU是一个面向非root Android设备的伪`Su`实现。可以通过项目
 
 |模式|UID|语境|触发条件|
 |------|-----|---------|----------|
-| **壳模式** | 2000 | `U:r：shell:s0` |静谷连接成功|
-| **降级模式** | 10380 | `U:r：untrusted_app_27:s0` |静谷连接失败|
+| **shell模式** | 2000 | `u:r：shell:s0` |shizuku连接成功|
+| **降级模式** | 10380 | `u:r：untrusted_app_27:s0` |shizuku连接失败|
 
 **执行流程：**
 1.尝试通过Rish/shizuku获取shell权限
@@ -39,8 +39,8 @@ aFakeSU/
 
 ##构建
 
-```猛击
-CD src
+```bash
+cd src
 bash build_su.sh
 ```
 
@@ -49,9 +49,10 @@ bash build_su.sh
 ##依赖
 
 -Android13+(SDK33)
--静谷经理已安装且服务器运行中
--本应用已授权静谷权限
--Termux+叮当(NDK)
-
+-shizuku已安装且服务器运行中
+-本应用已授权shizuku权限
+-Termux+NDK
+.deb包时常有问题
+想要使用shell权限运行必须将可执行文件复制/data/local/tmp
 本项目仅供娱乐
 源码有缺陷去Release页面下载最新的.deb包或者.zip
