@@ -1,5 +1,4 @@
-#aFakeSU
-##简介
+##aFakeSU
 
 aFakeSU是一个面向非root Android设备的伪`Su`实现。可以通过项目根目录的su文件用shell执行，不过这通常是汇报没有权限的所以你可以手动把产物移动到/data/local/tmp/，可以在任何拥有执行权限的用户下运行此二进制文件，算是为不能root的主机运行需要root的脚本,始终骗不过深度检查
 
