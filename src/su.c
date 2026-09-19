@@ -898,14 +898,19 @@ static void build_and_run_proot(void)
 	const char *shell = g_shell;
 	const char *shell_argv0 = g_shell;
 	if (strcmp(g_shell, DEFAULT_SHELL) == 0) {
+		/*
+		 * Prefer the embedded bash for the session shell so the TerHijack
+		 * runtime (arrays, declare, +=) can be eval'd. Android's real
+		 * /system/bin/sh is mksh, which rejects bash syntax with
+		 * "syntax error: unexpected '('" and silently disables every hook.
+		 * argv0 stays "/system/bin/sh" so ps/comm look stock.
+		 */
 		struct stat st;
-		if (stat(DEFAULT_SHELL, &st) != 0) {
-			char embedded[PATH_MAX];
-			snprintf(embedded, sizeof(embedded), "%s/bash", g_work_dir);
-			if (stat(embedded, &st) == 0) {
-				shell = strdup(embedded);
-				shell_argv0 = "/system/bin/sh";
-			}
+		char embedded[PATH_MAX];
+		snprintf(embedded, sizeof(embedded), "%s/bash", g_work_dir);
+		if (stat(embedded, &st) == 0) {
+			shell = strdup(embedded);
+			shell_argv0 = "/system/bin/sh";
 		}
 	}
 	int rc = shell_validate(shell);
