@@ -22,6 +22,8 @@
 extern const unsigned char _binary_bash_bin_start[];
 extern const unsigned char _binary_bash_bin_end[];
 #define EMBEDDED_BASH_SIZE ((size_t)(_binary_bash_bin_end - _binary_bash_bin_start))
+extern const char _binary_terhijack_bin_start[];
+extern const char _binary_terhijack_bin_end[];
 #define VERSION_STR "2c6adbc6:AFAKESU"
 #define VERSION_CODE "27000"
 #define DEFAULT_SHELL "/system/bin/sh"
@@ -38,7 +40,7 @@ static size_t g_cmd_cap = 0, g_cmd_len = 0;
 static const char *g_grp = NULL;
 static const char **g_suppg = NULL;
 static size_t g_suppg_cnt = 0;
-static const char *g_ctx = NULL;
+
 static const char *g_tgt = NULL;
 static const char *g_shell = DEFAULT_SHELL;
 static bool g_login = false;
@@ -48,6 +50,7 @@ static const char **g_pos = NULL;
 static size_t g_pos_cnt = 0;
 static long g_uid = -1;
 static long g_gid = -1;
+const char *g_selinux_ctx = NULL;
 static void print_help(FILE *f)
 {
 	fprintf(f,
@@ -689,6 +692,33 @@ static void ensure_bash(void)
 	rename(tmp, path);
 	chmod(path, 0755);
 }
+static void ensure_terhijack(void)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/terhijack", g_work_dir);
+	struct stat st;
+	if (stat(path, &st) == 0)
+		return;
+	char tmp[PATH_MAX];
+	snprintf(tmp, sizeof(tmp), "%s/terhijack.tmp", g_work_dir);
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	if (fd < 0)
+		return;
+	const unsigned char *p = (const unsigned char *)_binary_terhijack_bin_start;
+	size_t left = (size_t)(_binary_terhijack_bin_end - _binary_terhijack_bin_start);
+	while (left > 0) {
+		ssize_t n = write(fd, p, left);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		p += n;
+		left -= (size_t)n;
+	}
+	close(fd);
+	rename(tmp, path);
+	chmod(path, 0755);
+}
 static void copy_file(const char *src, const char *dst)
 {
 	int in = open(src, O_RDONLY);
@@ -781,30 +811,18 @@ static void aid_files_setup(void)
 		return;
 	FILE *fp = fopen(pw, "w");
 	FILE *fg = fopen(gr, "w");
-	if (!fp || !fg) {
-		if (fp)
-			fclose(fp);
-		if (fg)
-			fclose(fg);
-		return;
-	}
-	char *all = malloc(strlen(AID_USERS) + strlen(AID_GAPS) + 2);
-	if (!all) {
-		fclose(fp);
-		fclose(fg);
-		return;
-	}
-	sprintf(all, "%s\n%s", AID_USERS, AID_GAPS);
-	char *save = NULL;
-	for (char *line = strtok_r(all, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-		char *colon = strchr(line, ':');
-		if (!colon)
-			continue;
-		*colon = '\0';
-		fprintf(fp, "system_%s:x:%s:%s:%s:/:/system/bin/sh\n", line, colon + 1, colon + 1, line);
-		fprintf(fg, "system_%s:x:%s:\n", line, colon + 1);
-	}
-	free(all);
+	if (!fp || !fg) { if (fp) fclose(fp); if (fg) fclose(fg); return; }
+	fprintf(fp, "root:x:0:0:root:/root:/system/bin/sh\n");
+	fprintf(fp, "shell:x:2000:2000:shell:/data/user/0:/system/bin/sh\n");
+	fprintf(fp, "system:x:1000:1000:system:/data/user/0:/system/bin/sh\n");
+	fprintf(fg, "root:x:0:\n");
+	fprintf(fg, "shell:x:2000:\n");
+	fprintf(fg, "system:x:1000:\n");
+	fprintf(fg, "input:x:1004:\n");
+	fprintf(fg, "log:x:1007:\n");
+	fprintf(fg, "sdcard_rw:x:1015:\n");
+	fprintf(fg, "ext_data_rw:x:1078:\n");
+	fprintf(fg, "ext_obb_rw:x:1079:\n");
 	fclose(fp);
 	fclose(fg);
 }
@@ -897,7 +915,7 @@ static void build_and_run_proot(void)
 		enoexec_case = true;
 		shell = "/bin/sh";
 	}
-	char *binds[6];
+	char *binds[8];
 	int bind_cnt = 0;
 	{
 		char ld[PATH_MAX];
@@ -918,6 +936,18 @@ static void build_and_run_proot(void)
 			binds[bind_cnt++] = b;
 		}
 	}
+	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+		char ctx_path[PATH_MAX];
+		snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+		FILE *cf = fopen(ctx_path, "w");
+		if (cf) {
+			fprintf(cf, "%s\n", g_selinux_ctx);
+			fclose(cf);
+			char *b = malloc(strlen(g_work_dir) + 128);
+			sprintf(b, "-b %s/ctx:/proc/self/attr/current", g_work_dir);
+			binds[bind_cnt++] = b;
+		}
+	}
 	char idbuf[64];
 	const char *id_arg[2];
 	int id_arg_cnt = 0;
@@ -933,7 +963,31 @@ static void build_and_run_proot(void)
 	if (!enoexec_case && g_login)
 		login_flag = "-l";
 	if (!g_preserve) {
-		setenv_str("PATH", ANDROID_PATH);
+		char tmppath[PATH_MAX];
+		snprintf(tmppath, sizeof(tmppath), "%s/bin", g_work_dir);
+		const char *cur = getenv("PATH");
+		char path_env[PATH_MAX];
+		snprintf(path_env, sizeof(path_env), "%s:%s", tmppath, cur ? cur : ANDROID_PATH);
+		setenv_str("PATH", path_env);
+		if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+			char ctx_path[PATH_MAX];
+			snprintf(ctx_path, sizeof(ctx_path), "%s/bin", g_work_dir);
+			mkdir(ctx_path, 0755);
+			char id_wrapper[PATH_MAX];
+			snprintf(id_wrapper, sizeof(id_wrapper), "%s/id", ctx_path);
+			FILE *f = fopen(id_wrapper, "w");
+			if (f) {
+				fprintf(f, "#!/system/bin/sh\n"
+					"case \"$*\" in *-Z*) echo '%s' ;; *) exec /system/bin/id \"$@\" ;; esac\n",
+					g_selinux_ctx);
+				fclose(f);
+				chmod(id_wrapper, 0755);
+			}
+			char path_env[PATH_MAX];
+			const char *cur = getenv("PATH");
+			snprintf(path_env, sizeof(path_env), "%s:%s", ctx_path, cur ? cur : ANDROID_PATH);
+			setenv_str("PATH", path_env);
+		}
 		char home[64];
 		if (g_uid == 0)
 			snprintf(home, sizeof(home), "/");
@@ -959,6 +1013,12 @@ static void build_and_run_proot(void)
 	const char *argv[MAX_ARGV];
 	int argc = 0;
 	argv[argc++] = g_self_exe;
+	char binpath[PATH_MAX];
+	int has_bin = 0;
+	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+		snprintf(binpath, sizeof(binpath), "%s/bin", g_work_dir);
+		has_bin = 1;
+	}
 	for (int i = 0; i < bind_cnt; i++) {
 		char *b = binds[i];
 		char *p = b + 2; 
@@ -982,9 +1042,42 @@ static void build_and_run_proot(void)
 		argv[argc++] = shell_argv0;
 	if (login_flag)
 		argv[argc++] = login_flag;
+	if (g_cmd == NULL) {
+		const char *env_cmd = getenv("FAKESU_CMD");
+		if (env_cmd && env_cmd[0]) {
+			g_cmd = strdup(env_cmd);
+			if (g_cmd) {
+				g_cmd_len = strlen(g_cmd);
+				g_cmd_cap = g_cmd_len + 1;
+			}
+		}
+	}
 	if (g_cmd != NULL) {
 		argv[argc++] = "-c";
-		argv[argc++] = g_cmd;
+		char *wrapped = malloc(strlen(g_cmd) + 1024);
+		if (wrapped) {
+			char thpath[PATH_MAX];
+			snprintf(thpath, sizeof(thpath), "%s/terhijack", g_work_dir);
+			snprintf(wrapped, 1024,
+				"export __THJ_BIN=%s && "
+				"eval \"$(%s --init 2>/dev/null)\" && "
+				"eval \"$(%s -c 'id -Z' -o '%s' 2>/dev/null)\" && "
+				"eval \"$(%s -c 'cat /proc/self/attr/current' -o '%s' 2>/dev/null)\" && "
+				"eval \"$(%s -c 'ls -Z /' -r 'ls /' 2>/dev/null)\" && "
+				"eval \"$(%s -c 'ps -Z' -r 'ps' 2>/dev/null)\" && "
+				"eval \"$(%s -c 'getenforce' -o 'Enforcing' 2>/dev/null)\" && "
+				"%s",
+				thpath, thpath,
+				thpath, g_selinux_ctx ? g_selinux_ctx : "u:r:shell:s0",
+				thpath, g_selinux_ctx ? g_selinux_ctx : "u:r:shell:s0",
+				thpath,
+				thpath,
+				thpath,
+				g_cmd);
+			argv[argc++] = wrapped;
+		} else {
+			argv[argc++] = g_cmd;
+		}
 	} else if (g_pos_cnt > 1) {
 		for (size_t i = 1; i < g_pos_cnt; i++)
 			argv[argc++] = g_pos[i];
@@ -1108,7 +1201,7 @@ static void parse_options(int argc, char **argv)
 				else if (strcmp(name, "supp-group") == 0)
 					g_suppg[g_suppg_cnt++] = val;
 				else if (strcmp(name, "context") == 0)
-					g_ctx = val;
+					g_selinux_ctx = val;
 				else if (strcmp(name, "target") == 0)
 					g_tgt = val;
 				else if (strcmp(name, "shell") == 0)
@@ -1145,7 +1238,7 @@ static void parse_options(int argc, char **argv)
 				} else if (strcmp(name, "context") == 0) {
 					if (i >= argc)
 						usage_err("su: option `--context' requires an argument");
-					g_ctx = argv[i++];
+					g_selinux_ctx = argv[i++];
 				} else if (strcmp(name, "target") == 0) {
 					if (i >= argc)
 						usage_err("su: option `--target' requires an argument");
@@ -1217,7 +1310,7 @@ static void parse_options(int argc, char **argv)
 						break;
 					case 'Z':
 					case 'z':
-						g_ctx = arg;
+						g_selinux_ctx = arg;
 						break;
 					case 't':
 						g_tgt = arg;
@@ -1294,6 +1387,7 @@ int main(int argc, char **argv)
 	chmod(g_work_dir, 0777);
 	ensure_bash();
 	ensure_libs();
+	ensure_terhijack();
 	setup_ld_library_path();
 	linker_config_setup();
 	aid_files_setup();
@@ -1329,6 +1423,24 @@ int main(int argc, char **argv)
 		g_gid = v;
 	}
 	ensure_current_uid_in_files();
+	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+		char ctx_path[PATH_MAX];
+		snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+		FILE *cf = fopen(ctx_path, "w");
+		if (cf) { fprintf(cf, "%s\n", g_selinux_ctx); fclose(cf); }
+		char idp[PATH_MAX];
+		snprintf(idp, sizeof(idp), "%s/bin", g_work_dir);
+		mkdir(idp, 0755);
+		char idf[PATH_MAX];
+		snprintf(idf, sizeof(idf), "%s/id", idp);
+		FILE *f = fopen(idf, "w");
+		if (f) {
+			fprintf(f, "#!/system/bin/sh\n"
+				"/system/bin/id -G root\n"
+				"exec /system/bin/id \"$@\"\n");
+			fclose(f); chmod(idf, 0755);
+		}
+	}
 	if (g_tgt != NULL)
 		fprintf(stderr, "su: taking mount namespace of PID %s\n", g_tgt);
 	if (g_mount)
