@@ -34,6 +34,12 @@ cp "$BASH_BIN" "$BLD/bash.bin"
     --rename-section .data=.rodata,alloc,load,readonly,data,contents \
     bash.bin bash.bin.o) || exit 1
 
+echo "== terhijack.bin (embedded hook engine, v1.2) =="
+$CC -O2 -std=c99 -o "$BLD/terhijack.bin" "$ROOT/terhijack.c" || exit 1
+(cd "$BLD" && objcopy -I binary -O elf64-littleaarch64 -B aarch64 \
+    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+    terhijack.bin terhijack.bin.o) || exit 1
+
 echo "== su.o =="
 $CC -c $COMMON -I"$PT" -I"$PT/src" \
     "$ROOT/su.c" -o "$BLD/su.o" || exit 1
@@ -47,23 +53,25 @@ while IFS= read -r f; do
     OBJS="$OBJS $f"
 done < <(find "$PT/src" -name "*.o" | sort)
 
-$CC -o "$ROOT/su.elf" \
-    "$BLD/cli.o" $OBJS "$BLD/talloc.o" "$BLD/shmem.o" "$BLD/su.o" "$BLD/bash.bin.o" \
+$CC -o "$ROOT/fakesu.elf" \
+    "$BLD/cli.o" $OBJS "$BLD/talloc.o" "$BLD/shmem.o" "$BLD/su.o" "$BLD/bash.bin.o" "$BLD/terhijack.bin.o" \
     -Wl,-z,noexecstack -llog || exit 1
 
-echo "== done: $ROOT/su.elf =="
-file "$ROOT/su.elf"
-SCRIPT_DIR="$ROOT"
-SCRIPT_FILE="$SCRIPT_DIR/../su"
-HOME_DIR="$(dirname "$SCRIPT_DIR")"
-cat > "$SCRIPT_FILE" << 'SCRIPT'
+echo "== done: $ROOT/fakesu.elf =="
+file "$ROOT/fakesu.elf"
+mkdir -p /sdcard/termux 2>/dev/null
+cp "$ROOT/fakesu.elf" /sdcard/termux/fakesu.elf 2>/dev/null
+chmod 755 /sdcard/termux/fakesu.elf 2>/dev/null
+
+SCRIPT_DIR="$ROOT/.."
+cat > "$SCRIPT_DIR/afake-su" << 'SCRIPT'
 #!/data/data/com.termux/files/usr/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 args=""
 for arg in "$@"; do
     args="$args '$arg'"
 done
-"$SCRIPT_DIR/rish" -c "/sdcard/termux/su2.elf $args "
+"$SCRIPT_DIR/rish" -c "/sdcard/termux/fakesu.elf $args "
 SCRIPT
-chmod +x "$SCRIPT_FILE"
-echo "== generated: $SCRIPT_FILE =="
+chmod +x "$SCRIPT_DIR/afake-su"
+echo "== generated: $SCRIPT_DIR/afake-su =="
