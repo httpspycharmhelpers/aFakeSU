@@ -26,6 +26,7 @@
 #include <linux/net.h>   /* SYS_*, */
 #include <fcntl.h>       /* AT_FDCWD, */
 #include <unistd.h>      /* close(2), */
+#include <sys/stat.h>    /* stat(2), access(2), mkdir(2) */
 #include <limits.h>      /* PATH_MAX, */
 #include <string.h>      /* strcpy */
 #include <stdbool.h>     /* bool */
@@ -114,6 +115,500 @@ static int translate_path2(Tracee *tracee, int dir_fd, char path[PATH_MAX], Reg 
 		return status;
 
 	return set_sysarg_path(tracee, new_path, reg);
+}
+
+extern char g_work_dir[PATH_MAX];
+
+/* AFAKESU: the kernel denies readlink("/proc/1/exe") to a shell
+ * domain, but a root masquerade should resolve init's exe.  PRoot's
+ * readlink_proc() never sees the final component of a readlink(2)
+ * request (the last name is handed to the kernel as-is), so redirect
+ * the readlink target to a real symlink answering the expected path. */
+static void afakesu_redirect_readlink_exe(Tracee *tracee, Reg path_reg)
+{
+	char path[PATH_MAX];
+	if (get_sysarg_path(tracee, path, path_reg) < 0)
+		return;
+
+	const char *leaf;
+	if (strcmp(path, "/proc/1/exe") == 0)
+		leaf = ".exe1";
+	else if (strcmp(path, "/proc/cmdline") == 0)
+		leaf = ".cmdline";
+	else if (strcmp(path, "/sys/fs/selinux/enforce") == 0)
+		leaf = ".enforce";
+	else
+		return;
+
+	char link[PATH_MAX];
+	snprintf(link, sizeof(link), "%s/%s", g_work_dir, leaf);
+	(void) set_sysarg_path(tracee, link, path_reg);
+}
+
+/*
+ * Rewrite <guest> /proc virtual files that an untrusted domain cannot read
+ * to private files *before* any path translation: canonicalizing them only
+ * once would walk the real node and die with EACCES, and the final
+ * component is a plain file PRoot's readlink_proc never consults for
+ * non-dereferencing syscalls.  The guest view keeps working and resolves to
+ * plausible kernel-visible data exactly like the real node.
+ */
+static void afakesu_redirect_proc1(Tracee *tracee, word_t syscall_number)
+{
+	Reg reg;
+	switch (syscall_number) {
+	case PR_readlink:
+	case PR_stat:
+	case PR_stat64:
+	case PR_lstat:
+	case PR_lstat64:
+	case PR_oldstat:
+	case PR_oldlstat:
+	case PR_access:
+	case PR_open:
+		reg = SYSARG_1;
+		break;
+	case PR_readlinkat:
+	case PR_newfstatat:
+	case PR_fstatat64:
+	case PR_statx:
+	case PR_openat:
+	case PR_faccessat:
+		reg = SYSARG_2;
+		break;
+	default:
+		return;
+	}
+	afakesu_redirect_readlink_exe(tracee, reg);
+}
+
+/*
+ * AFAKESU writable overlay for "remounted" RO partitions.
+ *
+ * su(1) seeds markers under <workdir>/.mnt (<system>, <vendor>,
+ * <product>, <odm>, <root>).  A guest path whose first component has a
+ * marker belongs to a root-writable tree: mutating syscalls are
+ * redirected into <workdir>/ov/<path>, read syscalls resolve the
+ * overlay only for files already there (directories keep the real
+ * backing node, so `ls`/`stat` of a partition root still shows the
+ * genuine device inode), and removals hit the overlay only if the
+ * shadow copy exists.  The overlay is app-owned; the exit stage
+ * re-stamps it as root.
+ */
+typedef enum {
+	AF_OV_READ   = 0,	/* overlay wins only when the leaf exists */
+	AF_OV_WRITE  = 1,	/* always write through to the overlay */
+	AF_OV_REMOVE = 2,	/* only meaningful if the file exists */
+} AfOvOp;
+
+static bool afakesu_ov_master_has(const char *comp)
+{
+	char marker[PATH_MAX];
+	struct stat st;
+	if (snprintf(marker, sizeof(marker), "%s/.mnt/%s", g_work_dir, comp) <= 0)
+		return false;
+	return stat(marker, &st) == 0;
+}
+
+static const char *afakesu_ov_path(const char *guest, bool *exists)
+{
+	static char ov[PATH_MAX];
+	const char *comp;
+	const char *slash;
+	char cbuf[64];
+	size_t n;
+
+	if (guest == NULL || guest[0] != '/')
+		return NULL;
+	comp = guest + 1;
+	if (*comp == '\0')
+		comp = "root/";
+	slash = strchr(comp, '/');
+	n = slash ? (size_t) (slash - comp) : strlen(comp);
+	if (n >= sizeof(cbuf))
+		n = sizeof(cbuf) - 1;
+	memcpy(cbuf, comp, n);
+	cbuf[n] = '\0';
+	if (!afakesu_ov_master_has(cbuf))
+		return NULL;
+	if (strcmp(cbuf, "data") == 0)	/* session home & friends: never */
+		return NULL;
+	if (snprintf(ov, sizeof(ov), "%s/ov/%s", g_work_dir, guest + 1) <= 0)
+		return NULL;
+	*exists = access(ov, F_OK) == 0;
+	return ov;
+}
+
+static void afakesu_ov_mkdirs(const char *ov)
+{
+	char buf[PATH_MAX];
+	char *p;
+	size_t base;
+
+	if (strlen(ov) >= sizeof(buf))
+		return;
+	strcpy(buf, ov);
+	base = strlen(g_work_dir) + 1;	/* index of "<workdir>/ov/..." */
+	if (strncmp(g_work_dir, buf, base - 1) != 0 || buf[base - 1] != '/')
+		return;
+	p = buf + base;
+	for (; *p; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		if (access(buf, F_OK) != 0)
+			(void) mkdir(buf, 0755);
+		*p = '/';
+	}
+}
+
+static int afakesu_overlay_reg(Tracee *tracee, Reg reg, AfOvOp op)
+{
+	char guest[PATH_MAX];
+	bool exists = false;
+
+	if (get_sysarg_path(tracee, guest, reg) < 0)
+		return 0;
+	const char *ov = afakesu_ov_path(guest, &exists);
+	if (ov == NULL)
+		return 0;
+	if (op == AF_OV_READ || op == AF_OV_REMOVE) {
+		if (!exists)
+			return 0;
+		if (op == AF_OV_READ) {
+			struct stat st;
+			if (stat(ov, &st) == 0 && S_ISDIR(st.st_mode))
+				return 0;
+		}
+	}
+	if (op == AF_OV_WRITE)
+		afakesu_ov_mkdirs(ov);
+	if (set_sysarg_path(tracee, ov, reg) < 0)
+		return 0;
+	return 1;
+}
+
+/* rename/link between a real path and an overlay path: materialize a
+ * copy when the source is a real (RO) file, then let the kernel move
+ * the overlay objects.  Handled fully when the destination is
+ * writable; the tracee sees success. */
+static int afakesu_overlay_rename_regs(Tracee *tracee, Reg src_reg, Reg dst_reg)
+{
+	char src[PATH_MAX];
+	char dst[PATH_MAX];
+	bool se = false;
+	bool de = false;
+
+	if (get_sysarg_path(tracee, src, src_reg) < 0)
+		return 0;
+	if (get_sysarg_path(tracee, dst, dst_reg) < 0)
+		return 0;
+	const char *sov = afakesu_ov_path(src, &se);
+	const char *dov = afakesu_ov_path(dst, &de);
+	if (dov == NULL)
+		return 0;
+	if (sov != NULL && se) {
+		afakesu_ov_mkdirs(dov);
+		if (set_sysarg_path(tracee, sov, src_reg) < 0)
+			return 0;
+		if (set_sysarg_path(tracee, dov, dst_reg) < 0)
+			return 0;
+		return 1;
+	}
+	afakesu_ov_mkdirs(dov);
+	{
+		int in = open(src, O_RDONLY);
+		if (in < 0)
+			return 0;
+		int out = open(dov, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (out < 0) {
+			close(in);
+			return 0;
+		}
+		char buf[65536];
+		ssize_t rd;
+		int bad = 0;
+		while ((rd = read(in, buf, sizeof(buf))) > 0) {
+			ssize_t off = 0;
+			while (off < rd) {
+				ssize_t wr = write(out, buf + off, rd - off);
+				if (wr < 0) {
+					bad = 1;
+					rd = -1;
+					break;
+				}
+				off += wr;
+			}
+			if (rd < 0)
+				break;
+		}
+		close(in);
+		close(out);
+		if (bad || rd < 0)
+			return 0;
+	}
+	set_sysnum(tracee, PR_void);
+	poke_reg(tracee, SYSARG_RESULT, 0);
+	return 1;
+}
+
+static const char *afakesu_read_session_ctx(void)
+{
+	static char ctx[256];
+	static bool loaded = false;
+	char ctx_path[PATH_MAX];
+	FILE *f;
+	size_t n;
+
+	if (loaded)
+		return ctx;
+
+	snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+	f = fopen(ctx_path, "r");
+	if (f == NULL)
+		return NULL;
+	if (fgets(ctx, sizeof(ctx), f) == NULL) {
+		fclose(f);
+		return NULL;
+	}
+	fclose(f);
+
+	n = strcspn(ctx, "\r\n");
+	ctx[n] = '\0';
+	if (n == 0)
+		return NULL;
+
+	loaded = true;
+	return ctx;
+}
+
+static bool afakesu_attr_name_is_selinux(const char *name)
+{
+	return strcmp(name, "current") == 0
+		|| strcmp(name, "prev") == 0
+		|| strcmp(name, "exec") == 0
+		|| strcmp(name, "fscreate") == 0
+		|| strcmp(name, "keycreate") == 0
+		|| strcmp(name, "sockcreate") == 0;
+}
+
+static bool afakesu_is_own_attr_path(const Tracee *tracee, const char *path)
+{
+	const char *pidp;
+	const char *slash;
+
+	if (strncmp(path, "/proc/", 6) != 0)
+		return false;
+
+	pidp = path + 6;
+	if (strncmp(pidp, "self", 4) == 0 && pidp[4] == '/')
+		return true;
+
+	slash = strchr(pidp, '/');
+	if (slash == NULL || (size_t) (slash - pidp) >= 32)
+		return false;
+	{
+		char pidbuf[32];
+		pid_t p;
+		memcpy(pidbuf, pidp, slash - pidp);
+		pidbuf[slash - pidp] = '\0';
+		p = (pid_t) atoi(pidbuf);
+		if (p == tracee->pid)
+			return true;
+		/* An in-session peer: any pid hosted by this PRoot (the shell,
+		 * ps, awk, ... ) must also answer like root, so `ps -AZ` shows
+		 * our whole tree with the session context while foreign
+		 * processes keep their real label. */
+		if (get_tracee(tracee, p, false) != NULL)
+			return true;
+		return false;
+	}
+}
+
+/*
+ * chcon/restorecon store: record the SELinux label a session "root"
+ * wrote with setxattr(security.selinux), keyed by the guest absolute
+ * path, and replay it for subsequent getxattr/lgetxattr/listxattr.  The
+ * store lives in the session workdir, so labels survive for the whole
+ * (fake-)root session.  Keys turn '/' into '%' so any path stays a
+ * plain filename under <workdir>/.xattrs/.
+ */
+static void afakesu_xattr_store_key(char *out, size_t cap, const char *guest)
+{
+	const char *s = guest;
+	size_t o = 0;
+
+	while (*s == '/')
+		s++;
+	for (; *s && o + 1 < cap; s++) {
+		if (*s == '/')
+			out[o++] = '%';
+		else
+			out[o++] = *s;
+	}
+	out[o] = '\0';
+}
+
+static const char *afakesu_xattr_lookup(const char *guest)
+{
+	static char key[PATH_MAX];
+	static char val[512];
+	char sp[PATH_MAX];
+	FILE *f;
+	size_t n;
+
+	afakesu_xattr_store_key(key, sizeof(key), guest);
+	if (snprintf(sp, sizeof(sp), "%s/.xattrs/%s", g_work_dir, key) <= 0)
+		return NULL;
+	f = fopen(sp, "r");
+	if (f == NULL)
+		return NULL;
+	if (fgets(val, sizeof(val), f) == NULL) {
+		fclose(f);
+		return NULL;
+	}
+	fclose(f);
+	n = strcspn(val, "\r\n");
+	val[n] = '\0';
+	if (n == 0)
+		return NULL;
+	return val;
+}
+
+/*
+ * Answer SELinux context syscalls ourselves, "like root would".
+ *
+ *  - setxattr/lsetxattr(security.selinux, ...): record the chcon label
+ *    into the fake store and claim success (real chcon would EPERM);
+ *    restorecon() writes "restore" to drop the override;
+ *  - getxattr/lgetxattr: replay a stored chcon label first, then the
+ *    process-context files (/proc/<own-pid>/attr/...), then overlay
+ *    files; everything else answers with its real backing label;
+ *  - listxattr: every labeled file carries security.selinux;
+ *  - getselfattr (raw 416, used by getcon()/id on modern bionic).
+ *
+ * The real syscall is replaced with the avoider and the answer is forged.
+ * sysexit_pending is set so that a second hand (translate_syscall_exit) can
+ * repair the result register, which the void syscall would otherwise clobber
+ * with -ENOSYS under seccomp.
+ */
+static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
+{
+	char path[PATH_MAX];
+	const char *ctx = NULL;
+	const char *value;
+	const char *tail;
+	const char *stored;
+	word_t buf;
+	word_t size;
+	size_t vlen;
+	word_t raw = peek_reg(tracee, ORIGINAL, SYSARG_NUM);
+
+	if (raw != 416
+	 && syscall_number != PR_getxattr && syscall_number != PR_lgetxattr
+	 && syscall_number != PR_listxattr && syscall_number != PR_llistxattr)
+		return false;
+
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP fx in sysnum=%d raw=%llu\n",
+			(int) syscall_number, (unsigned long long) raw);
+
+	/*
+	 * security.getselfattr: the whole process context, no path involved.
+	 * The caller is the *current* process, so our session context applies.
+	 */
+	if (raw == 416) {
+		ctx = afakesu_read_session_ctx();
+		if (ctx == NULL)
+			return false;
+		value = ctx;
+		vlen = strlen(ctx) + 1;
+		buf = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		size = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		goto answer;
+	}
+
+	if (get_sysarg_path(tracee, path, SYSARG_1) < 0)
+		return false;
+
+	/* A stored chcon/restorecon label has top priority. */
+	stored = afakesu_xattr_lookup(path);
+	if (stored != NULL) {
+		value = stored;
+		vlen = strlen(stored) + 1;
+		buf = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		size = peek_reg(tracee, ORIGINAL, SYSARG_4);
+		goto answer;
+	}
+
+	if (!afakesu_is_own_attr_path(tracee, path)) {
+		/* A file materialized in the RW overlay answers like a file
+		 * created by real root (system partitions keep system_file). */
+		bool exists = false;
+		const char *ov = afakesu_ov_path(path, &exists);
+		if (ov == NULL || !exists)
+			return false;
+		if (syscall_number == PR_listxattr || syscall_number == PR_llistxattr) {
+			value = "security.selinux";
+			vlen = sizeof("security.selinux");
+			buf = peek_reg(tracee, ORIGINAL, SYSARG_2);
+			size = peek_reg(tracee, ORIGINAL, SYSARG_3);
+			goto answer;
+		}
+		struct stat st;
+		if (stat(ov, &st) == 0 && S_ISDIR(st.st_mode))
+			return false;
+		value = "u:object_r:system_file:s0";
+		vlen = sizeof("u:object_r:system_file:s0"); /* includes NUL */
+		buf = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		size = peek_reg(tracee, ORIGINAL, SYSARG_4);
+		goto answer;
+	}
+
+	/* listxattr/llistxattr: our files carry security.selinux. */
+	if (syscall_number == PR_listxattr || syscall_number == PR_llistxattr) {
+		value = "security.selinux";
+		vlen = sizeof("security.selinux"); /* includes NUL */
+		buf = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		size = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		goto answer;
+	}
+
+	/* Only the attribute names we own may be answered. */
+	tail = strstr(path, "/attr/");
+	if (tail == NULL) {
+		/* The "attr" directory itself carries the process label. */
+		if (strcmp(path + strlen(path) - strlen("/attr"), "/attr") != 0)
+			return false;
+	} else if (!afakesu_attr_name_is_selinux(tail + strlen("/attr/"))) {
+		return false;
+	}
+
+	ctx = afakesu_read_session_ctx();
+	if (ctx == NULL)
+		return false;
+	value = ctx;
+	vlen = strlen(ctx) + 1;
+	buf = peek_reg(tracee, ORIGINAL, SYSARG_3);
+	size = peek_reg(tracee, ORIGINAL, SYSARG_4);
+
+answer:
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP fx forge path-or-416=%llu vlen=%zu size=%llu val=%s\n",
+			(unsigned long long) raw, vlen,
+			(unsigned long long) size, value);
+
+	if ((size_t) size >= vlen)
+		(void) write_data(tracee, buf, value, vlen);
+
+	/* The real syscall must not run: swap in the avoider. */
+	set_sysnum(tracee, PR_void);
+	poke_reg(tracee, SYSARG_RESULT, (word_t) vlen);
+	/* Make sure the seccomp/PTRACE machinery still hits the exit stage, so
+	 * the result register can be repaired there if the kernel overwrites it. */
+	tracee->sysexit_pending = true;
+	tracee->restart_how = PTRACE_SYSCALL;
+	return true;
 }
 
 /**
@@ -1839,13 +2334,25 @@ int translate_syscall_enter(Tracee *tracee)
 
 	/* Translate input arguments. */
 	syscall_number = get_sysnum(tracee, ORIGINAL);
+	if (getenv("THJ_PDBG")) {
+		word_t thj_raw = peek_reg(tracee, ORIGINAL, SYSARG_NUM);
+		if ((thj_raw >= 8 && thj_raw <= 16) || (thj_raw >= 190 && thj_raw <= 196)
+		 || (thj_raw >= 340 && thj_raw <= 346) || (thj_raw >= 400 && thj_raw <= 470)) {
+			char thj_buf[PATH_MAX] = { 0 };
+			get_sysarg_path(tracee, thj_buf, SYSARG_1);
+			fprintf(stderr, "THJP xat-in raw=%llu pr=%d a1=%s\n",
+				(unsigned long long) thj_raw, (int) syscall_number, thj_buf);
+		}
+	}
+	if (!afakesu_forge_xattr(tracee, syscall_number)) {
+	afakesu_redirect_proc1(tracee, syscall_number);
 	switch (syscall_number) {
 	default:
-		/* Nothing to do. */
-		status = 0;
-		break;
+	/* Nothing to do. */
+	status = 0;
+	break;
 
-	case PR_execve:
+case PR_execve:
 		status = translate_execve_enter(tracee);
 		break;
 
@@ -2373,6 +2880,27 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_uselib:
 	case PR_utime:
 	case PR_utimes:
+		{
+			AfOvOp op = AF_OV_READ;
+			switch (syscall_number) {
+			case PR_chmod:
+			case PR_chown:
+			case PR_chown32:
+			case PR_mknod:
+			case PR_removexattr:
+			case PR_setxattr:
+			case PR_truncate:
+			case PR_truncate64:
+			case PR_utime:
+			case PR_utimes:
+				op = AF_OV_WRITE;
+				break;
+			default:
+				break;
+			}
+			if (afakesu_overlay_reg(tracee, SYSARG_1, op))
+				break;
+		}
 		status = translate_sysarg(tracee, SYSARG_1, REGULAR);
 		break;
 
@@ -2467,6 +2995,10 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_open:
 		flags = peek_reg(tracee, CURRENT, SYSARG_2);
 
+		if (afakesu_overlay_reg(tracee, SYSARG_1,
+			((flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) != 0) ? AF_OV_WRITE : AF_OV_READ))
+			break;
+
 		if (tracee->execfn_addr != 0
 		    && read_string(tracee, path, peek_reg(tracee, CURRENT, SYSARG_1), PATH_MAX) > 0
 		    && strcmp(path, "/proc/self/auxv") == 0) {
@@ -2488,6 +3020,11 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_newfstatat:
 	case PR_utimensat:
 	case PR_name_to_handle_at:
+		if (afakesu_overlay_reg(tracee, SYSARG_2,
+			(syscall_number == PR_fchownat || syscall_number == PR_utimensat)
+				? AF_OV_WRITE : AF_OV_READ))
+			break;
+
 		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 
 		status = get_sysarg_path(tracee, path, SYSARG_2);
@@ -2510,6 +3047,11 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_faccessat2:
 	case PR_futimesat:
 	case PR_mknodat:
+		if (afakesu_overlay_reg(tracee, SYSARG_2,
+			(syscall_number == PR_faccessat || syscall_number == PR_faccessat2)
+				? AF_OV_READ : AF_OV_WRITE))
+			break;
+
 		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 
 		status = get_sysarg_path(tracee, path, SYSARG_2);
@@ -2529,6 +3071,17 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 
 	case PR_readlink:
+		status = translate_sysarg(tracee, SYSARG_1, SYMLINK);
+		if (status < 0)
+			break;
+		if (getenv("THJ_PDBG")) {
+			char rlpath[PATH_MAX];
+			if (get_sysarg_path(tracee, rlpath, SYSARG_1) >= 0)
+				fprintf(stderr, "THJP rl in %s\n", rlpath);
+		}
+		afakesu_redirect_readlink_exe(tracee, SYSARG_1);
+		break;
+
 	case PR_lchown:
 	case PR_lchown32:
 	case PR_lgetxattr:
@@ -2540,6 +3093,11 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_oldlstat:
 	case PR_unlink:
 	case PR_rmdir:
+		if (afakesu_overlay_reg(tracee, SYSARG_1,
+			(syscall_number == PR_unlink || syscall_number == PR_rmdir)
+				? AF_OV_REMOVE : AF_OV_READ))
+			break;
+
 		status = translate_sysarg(tracee, SYSARG_1, SYMLINK);
 		break;
 
@@ -2547,6 +3105,9 @@ int translate_syscall_enter(Tracee *tracee)
 		/* The final component is created by the kernel: translate the
 		 * parent only so PRoot doesn't probe the not-yet-existing name
 		 * (see translate_path2_parent).  */
+		if (afakesu_overlay_reg(tracee, SYSARG_1, AF_OV_WRITE))
+			break;
+
 		status = get_sysarg_path(tracee, path, SYSARG_1);
 		if (status < 0)
 			break;
@@ -2604,6 +3165,10 @@ int translate_syscall_enter(Tracee *tracee)
 		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 		flags = peek_reg(tracee, CURRENT, SYSARG_3);
 
+		if (afakesu_overlay_reg(tracee, SYSARG_2,
+			((flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) != 0) ? AF_OV_WRITE : AF_OV_READ))
+			break;
+
 		status = get_sysarg_path(tracee, path, SYSARG_2);
 		if (status < 0)
 			break;
@@ -2623,9 +3188,26 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 
 	case PR_readlinkat:
-	case PR_unlinkat:
 		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 
+		status = get_sysarg_path(tracee, path, SYSARG_2);
+		if (status < 0)
+			break;
+
+		status = translate_path2(tracee, dirfd, path, SYSARG_2, SYMLINK);
+		if (status < 0)
+			break;
+
+		if (getenv("THJ_PDBG"))
+			fprintf(stderr, "THJP rlat in %s\n", path);
+		afakesu_redirect_readlink_exe(tracee, SYSARG_2);
+		break;
+
+	case PR_unlinkat:
+		if (afakesu_overlay_reg(tracee, SYSARG_2, AF_OV_REMOVE))
+			break;
+
+		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 		status = get_sysarg_path(tracee, path, SYSARG_2);
 		if (status < 0)
 			break;
@@ -2636,6 +3218,9 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_mkdirat:
 		/* Created destination: translate the parent only, don't probe
 		 * the new directory name (see translate_path2_parent).  */
+		if (afakesu_overlay_reg(tracee, SYSARG_2, AF_OV_WRITE))
+			break;
+
 		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 
 		status = get_sysarg_path(tracee, path, SYSARG_2);
@@ -2647,6 +3232,12 @@ int translate_syscall_enter(Tracee *tracee)
 
 	case PR_link:
 	case PR_rename:
+		if (syscall_number == PR_rename
+		    && afakesu_overlay_rename_regs(tracee, SYSARG_1, SYSARG_2)) {
+			status = 0;
+			break;
+		}
+
 		status = translate_sysarg(tracee, SYSARG_1, SYMLINK);
 		if (status < 0)
 			break;
@@ -2664,6 +3255,11 @@ int translate_syscall_enter(Tracee *tracee)
 
 	case PR_renameat:
 	case PR_renameat2:
+		if (afakesu_overlay_rename_regs(tracee, SYSARG_2, SYSARG_4)) {
+			status = 0;
+			break;
+		}
+
 		olddirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 		newdirfd = peek_reg(tracee, CURRENT, SYSARG_3);
 
@@ -2686,6 +3282,9 @@ int translate_syscall_enter(Tracee *tracee)
 		/* SYSARG_1 is the symlink's contents (not a path); only the
 		 * linkpath in SYSARG_2 is created.  Translate its parent only
 		 * so PRoot doesn't probe the new name (see translate_path2_parent).  */
+		if (afakesu_overlay_reg(tracee, SYSARG_2, AF_OV_WRITE))
+			break;
+
 		status = get_sysarg_path(tracee, newpath, SYSARG_2);
 		if (status < 0)
 			break;
@@ -2694,6 +3293,9 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 
 	case PR_symlinkat:
+		if (afakesu_overlay_reg(tracee, SYSARG_3, AF_OV_WRITE))
+			break;
+
 		newdirfd = peek_reg(tracee, CURRENT, SYSARG_2);
 
 		status = get_sysarg_path(tracee, newpath, SYSARG_3);
@@ -2704,6 +3306,9 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 
 	case PR_statx:
+		if (afakesu_overlay_reg(tracee, SYSARG_2, AF_OV_READ))
+			break;
+
 		newdirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 
 		status = get_sysarg_path(tracee, newpath, SYSARG_2);
@@ -2860,7 +3465,10 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 	}
 
-	}
+	} /* end of the switch (only when the syscall was not forged) */
+	} /* end of the "not forged" guard */
+
+	(void) flags;
 
 
 end:

@@ -22,11 +22,14 @@
 
 #include <errno.h>       /* errno(3), E* */
 #include <stdio.h>       /* sscanf(3), */
+#include <sys/stat.h>    /* struct stat, S_IFMT */
 #include <sys/utsname.h> /* struct utsname, */
+#include <linux/stat.h>  /* struct statx, */
 #include <linux/net.h>   /* SYS_*, */
 #include <linux/ioctl.h> /* _IOW, */
 #include <linux/prctl.h> /* PR_GET_AUXV, */
 #include <string.h>      /* strlen(3), */
+#include <time.h>        /* clock_gettime(3), */
 #include <unistd.h>      /* readlink(2), */
 
 #include "cli/note.h"
@@ -48,6 +51,237 @@
 #include "ptrace/wait.h"
 #include "extension/extension.h"
 #include "arch.h"
+
+extern char g_work_dir[PATH_MAX];
+
+/* AFAKESU: the /proc stand-ins (ctx, status) are plain regular files
+ * under the su wrapper's workdir; a bare stat() on them leaks their
+ * real size/mode ("Size=14, 1777") to a forensic check.  Rewrite the
+ * stat result so those virtual files look like genuine procfs ones:
+ * regular, size 0, owned by root, mode per file. */
+static bool attr_name_is_selinux(const char *name)
+{
+	return strcmp(name, "current") == 0 || strcmp(name, "prev") == 0
+	    || strcmp(name, "exec") == 0 || strcmp(name, "fscreate") == 0
+	    || strcmp(name, "keycreate") == 0 || strcmp(name, "sockcreate") == 0;
+}
+
+/* AFAKESU: fake process-attribute xattr results.  The kernel normally
+ * answers via getxattr/llistxattr on /proc/self/attr/...; these are not
+ * intercepted by PRoot, so the *real* per-process label leaks.  Instead the
+ * enter stage replaces the syscalls with the avoider and the buffer + result
+ * are rebuilt here (and a best-effort answer is pinned at enter too, in case
+ * the seccomp machinery skips the exit stage). */
+static bool afakesu_load_ctx(char out[256], size_t *out_n)
+{
+	char ctx_path[PATH_MAX];
+	FILE *f;
+	size_t n;
+
+	snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+	f = fopen(ctx_path, "r");
+	if (f == NULL)
+		return false;
+	if (fgets(out, 256, f) == NULL) {
+		fclose(f);
+		return false;
+	}
+	fclose(f);
+
+	n = strcspn(out, "\r\n");
+	out[n] = '\0';
+	if (n == 0)
+		return false;
+	*out_n = n;
+	return true;
+}
+
+static bool afakesu_own_attr_path(const Tracee *tracee, const char *path)
+{
+	const char *pidstr;
+	const char *slash;
+
+	if (strncmp(path, "/proc/", 6) != 0)
+		return false;
+
+	pidstr = path + 6;
+	if (strncmp(pidstr, "self/", 5) == 0)
+		return true;
+
+	slash = strchr(pidstr, '/');
+	if (slash == NULL || (size_t) (slash - pidstr) >= 32)
+		return false;
+	{
+		char pidbuf[32];
+		pid_t p;
+		memcpy(pidbuf, pidstr, slash - pidstr);
+		pidbuf[slash - pidstr] = '\0';
+		p = (pid_t) atoi(pidbuf);
+		if (p == tracee->pid)
+			return true;
+		if (get_tracee(tracee, p, false) != NULL)
+			return true;
+		return false;
+	}
+	return true;
+}
+
+static void afakesu_poke_attr_value(Tracee *tracee, const char *value,
+				    size_t vlen, word_t buf_reg, word_t size_reg)
+{
+	word_t buf = peek_reg(tracee, ORIGINAL, buf_reg);
+	word_t size = peek_reg(tracee, ORIGINAL, size_reg);
+
+	if ((size_t) size >= vlen)
+		(void) write_data(tracee, buf, value, vlen);
+	poke_reg(tracee, SYSARG_RESULT, (word_t) vlen);
+}
+
+static void afakesu_patch_proc_getxattr(Tracee *tracee)
+{
+	char path[PATH_MAX];
+	const char *attr;
+	word_t path_addr;
+	char ctx[256];
+	size_t n;
+	int r;
+
+	path_addr = peek_reg(tracee, MODIFIED, SYSARG_1);
+	r = read_string(tracee, path, path_addr, PATH_MAX);
+	if (r <= 1)
+		return;
+
+	if (!afakesu_own_attr_path(tracee, path))
+		return;
+
+	attr = strstr(path, "/attr/");
+	if (attr == NULL) {
+		/* The "attr" directory itself carries the process label. */
+		if (strcmp(path + strlen(path) - 5, "/attr") != 0)
+			return;
+	} else if (!attr_name_is_selinux(attr + 6)) {
+		return;
+	}
+
+	if (!afakesu_load_ctx(ctx, &n))
+		return;
+
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP gx exit path=%s vlen=%zu\n", path, n + 1);
+	afakesu_poke_attr_value(tracee, ctx, n + 1, SYSARG_3, SYSARG_4);
+}
+
+static void afakesu_patch_proc_listxattr(Tracee *tracee)
+{
+	char path[PATH_MAX];
+	word_t path_addr;
+	int r;
+
+	path_addr = peek_reg(tracee, MODIFIED, SYSARG_1);
+	r = read_string(tracee, path, path_addr, PATH_MAX);
+	if (r <= 1)
+		return;
+
+	if (!afakesu_own_attr_path(tracee, path))
+		return;
+
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP lx exit path=%s\n", path);
+	afakesu_poke_attr_value(tracee, "security.selinux",
+				sizeof("security.selinux"), SYSARG_2, SYSARG_3);
+}
+
+static void afakesu_patch_getselfattr(Tracee *tracee)
+{
+	char ctx[256];
+	size_t n;
+
+	if (!afakesu_load_ctx(ctx, &n))
+		return;
+
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP gs exit vlen=%zu\n", n + 1);
+	afakesu_poke_attr_value(tracee, ctx, n + 1, SYSARG_2, SYSARG_3);
+}
+
+static void afakesu_patch_proc_stat(Tracee *tracee, word_t sysnum)
+{
+	word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	if (result < 0)
+		return;
+
+	/* The syscall executed on the translated (host) path.  */
+	char host[PATH_MAX];
+	word_t host_addr = peek_reg(tracee, MODIFIED, SYSARG_2);
+	if (read_string(tracee, host, host_addr, PATH_MAX) <= 1)
+		return;
+
+	int mode = 0;
+	int keep_size = 0;
+	int overlay = 0;
+	size_t wd = strlen(g_work_dir);
+	if (strncmp(host, g_work_dir, wd) == 0) {
+		const char *tail = host + wd;
+		if (strcmp(tail, "/ctx") == 0)
+			mode = 0666;   /* /proc/<pid>/attr/current: rw-rw-rw- */
+		else if (strcmp(tail, "/status") == 0)
+			mode = 0400;   /* /proc/<pid>/status owner-read */
+		else if (strcmp(tail, "/.cmdline") == 0) {
+			mode = 0444;   /* /proc/cmdline world-readable */
+			keep_size = 1; /* size is the real file's size */
+		} else if (strcmp(tail, "/.enforce") == 0) {
+			mode = 0444;   /* /sys/fs/selinux/enforce world-readable */
+			keep_size = 1;
+		} else if (strncmp(tail, "/ov/", 4) == 0) {
+			/* Writable-overlay objects are owned (and stamped) by root
+			 * while keeping the real mode and size. */
+			overlay = 1;
+		} else
+			return;
+	} else {
+		return;
+	}
+
+	word_t buf = peek_reg(tracee, ORIGINAL, (sysnum == PR_statx) ? SYSARG_5 : SYSARG_3);
+	struct timespec now;
+	clock_gettime(CLOCK_REALTIME, &now);
+	if (sysnum == PR_statx) {
+		struct statx st;
+		if (read_data(tracee, &st, buf, sizeof(st)) < 0)
+			return;
+		st.stx_mode = (overlay || mode == 0) ? st.stx_mode : (st.stx_mode & S_IFMT) | mode;
+		st.stx_uid = 0;
+		st.stx_gid = 0;
+		if (!keep_size && mode != 0)
+			st.stx_size = 0;
+		st.stx_nlink = 1;
+		st.stx_blocks = 0;
+		st.stx_blksize = 4096;
+		st.stx_mtime.tv_sec = (__s32) now.tv_sec;
+		st.stx_mtime.tv_nsec = now.tv_nsec;
+		st.stx_atime.tv_sec = (__s32) now.tv_sec;
+		st.stx_atime.tv_nsec = now.tv_nsec;
+		st.stx_ctime.tv_sec = (__s32) now.tv_sec;
+		st.stx_ctime.tv_nsec = now.tv_nsec;
+		(void) write_data(tracee, buf, &st, sizeof(st));
+	} else {
+		struct stat st;
+		if (read_data(tracee, &st, buf, sizeof(st)) < 0)
+			return;
+		st.st_mode = (overlay || mode == 0) ? st.st_mode : (st.st_mode & S_IFMT) | mode;
+		st.st_uid = 0;
+		st.st_gid = 0;
+		if (!keep_size && mode != 0)
+			st.st_size = 0;
+		st.st_nlink = 1;
+		st.st_blocks = 0;
+		st.st_blksize = 4096;
+		st.st_atime = now.tv_sec;
+		st.st_mtime = now.tv_sec;
+		st.st_ctime = now.tv_sec;
+		(void) write_data(tracee, buf, &st, sizeof(st));
+	}
+}
 
 /**
  * Translate the output arguments of the current @tracee's syscall in
@@ -86,6 +320,10 @@ void translate_syscall_exit(Tracee *tracee)
 	 * - goto end: nothing else to do.
 	 */
 	syscall_number = get_sysnum(tracee, ORIGINAL);
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP exit-in sysnum=%d raw=%llu\n",
+			(int) syscall_number,
+			(unsigned long long) peek_reg(tracee, ORIGINAL, SYSARG_NUM));
 	syscall_result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
 	switch (syscall_number) {
 	case PR_brk:
@@ -655,6 +893,12 @@ void translate_syscall_exit(Tracee *tracee)
 
 	case PR_wait4:
 	case PR_waitpid:
+		if ((word_t) peek_reg(tracee, ORIGINAL, SYSARG_NUM) == 416) {
+			/* security.getselfattr rides the same enum slot as
+			 * wait4 on this build; it has no path argument. */
+			afakesu_patch_getselfattr(tracee);
+			goto end;
+		}
 		if (tracee->as_ptracer.waits_in != WAITS_IN_PROOT)
 			goto end;
 
@@ -730,6 +974,7 @@ void translate_syscall_exit(Tracee *tracee)
 
 	case PR_statx:
 		status = handle_statx_syscall(tracee, false);
+		afakesu_patch_proc_stat(tracee, syscall_number);
 		break;
 
 	case PR_ioctl:
@@ -794,6 +1039,30 @@ void translate_syscall_exit(Tracee *tracee)
 		 * namespace the tracee doesn't really have into an ack.  */
 		handle_netlink_reply_exit(tracee, syscall_number);
 		goto end;
+
+	case PR_newfstatat:
+	case PR_fstatat64:
+		afakesu_patch_proc_stat(tracee, syscall_number);
+		goto end;
+
+	case PR_getxattr:
+	case PR_lgetxattr:
+		afakesu_patch_proc_getxattr(tracee);
+		goto end;
+
+	case PR_listxattr:
+	case PR_llistxattr:
+		afakesu_patch_proc_listxattr(tracee);
+		goto end;
+
+	case PR_fgetxattr: {
+		if (getenv("THJ_PDBG")) {
+			fprintf(stderr, "THJP fgx fd=%d res=%d\n",
+				(int) peek_reg(tracee, CURRENT, SYSARG_1),
+				(int) peek_reg(tracee, CURRENT, SYSARG_RESULT));
+		}
+		goto end;
+	}
 
 	default:
 		goto end;

@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/prctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,10 @@ extern const unsigned char _binary_bash_bin_end[];
 #define EMBEDDED_BASH_SIZE ((size_t)(_binary_bash_bin_end - _binary_bash_bin_start))
 extern const char _binary_terhijack_bin_start[];
 extern const char _binary_terhijack_bin_end[];
+extern const unsigned char _binary_libiconv_so_start[];
+extern const unsigned char _binary_libiconv_so_end[];
+extern const unsigned char _binary_libncursesw_so_6_5_start[];
+extern const unsigned char _binary_libncursesw_so_6_5_end[];
 #define VERSION_STR "2c6adbc6:AFAKESU"
 #define VERSION_CODE "27000"
 #define DEFAULT_SHELL "/system/bin/sh"
@@ -34,7 +39,10 @@ extern const char _binary_terhijack_bin_end[];
 #define RISHQ_NAME "rishq"
 static char g_self_exe[PATH_MAX];
 static char g_self_dir[PATH_MAX];
-static char g_work_dir[PATH_MAX];
+char g_work_dir[PATH_MAX];
+char g_proot_argv0[64];
+int g_proot_argv0_fix = 0;
+static const char *g_fake_name = "sh";
 static char *g_cmd = NULL;
 static size_t g_cmd_cap = 0, g_cmd_len = 0;
 static const char *g_grp = NULL;
@@ -51,6 +59,197 @@ static size_t g_pos_cnt = 0;
 static long g_uid = -1;
 static long g_gid = -1;
 const char *g_selinux_ctx = NULL;
+
+/* /system/bin/id would report the *real* process context (getselfattr is
+ * outside PRoot's interception), so the session's `id` is our own sh
+ * wrapper that answers like a genuine root shell. */
+static void emit_id_wrapper(FILE *f, const char *ctx)
+{
+	fprintf(f, "#!/system/bin/sh\n"
+		"case \"$*\" in\n"
+		"  *-Z*) echo '%s' ;;\n"
+		"  *-un) echo root ;;\n"
+		"  *-u*) echo 0 ;;\n"
+		"  *-g*) echo 0 ;;\n"
+		"  *-G) echo 0 ;;\n"
+		"  *) echo \"uid=0(root) gid=0(root) groups=0(root) context=%s\" ;;\n"
+		"esac\n",
+		ctx, ctx);
+}
+
+/*
+ * Persisted property overrides.  Real root flips read-only props with
+ * resetprop/setprop (ro.debuggable, ro.build.*, ro.product.*, ...); a
+ * fake root owns a store that shadows the real property service for every
+ * process under the session's PATH (getprop/resetprop/setprop first).
+ */
+static void emit_prop_wrappers(const char *ctx_path)
+{
+	const char *wd = g_work_dir ? g_work_dir : "/data/local/tmp/termux";
+	char st[PATH_MAX];
+	char p[PATH_MAX];
+	snprintf(st, sizeof(st), "%s/.props", wd);
+
+	snprintf(p, sizeof(p), "%s/getprop", ctx_path);
+	FILE *f = fopen(p, "w");
+	if (f) {
+		fprintf(f,
+			"#!/system/bin/sh\n"
+			"P=\"%s\"\n"
+			"[ -f \"$P\" ] || exec /system/bin/getprop \"$@\"\n"
+			"if [ \"$#\" -eq 0 ] || [ \"$1\" = \"-p\" ]; then\n"
+			"  X=\n"
+			"  while IFS='=' read -r k v; do X=\"${X}${k}|\"; done < \"$P\"\n"
+			"  X=$(echo \"$X\" | sed 's/|$//')\n"
+			"  if [ -n \"$X\" ]; then\n"
+			"    /system/bin/getprop \"$@\" | grep -vE \"^\\[($X)\\]\"\n"
+			"  else\n"
+			"    /system/bin/getprop \"$@\"\n"
+			"  fi\n"
+			"  while IFS='=' read -r k v; do echo \"[$k]: [$v]\"; done < \"$P\"\n"
+			"  exit 0\n"
+			"fi\n"
+			"while IFS='=' read -r k v; do\n"
+			"  [ \"$k\" = \"$1\" ] && { echo \"$v\"; exit 0; }\n"
+			"done < \"$P\"\n"
+			"exec /system/bin/getprop \"$@\"\n",
+			st);
+		fclose(f);
+		chmod(p, 0755);
+	}
+
+	static const char *names[] = { "setprop", "resetprop" };
+	size_t i;
+	for (i = 0; i < 2; i++) {
+		snprintf(p, sizeof(p), "%s/%s", ctx_path, names[i]);
+		f = fopen(p, "w");
+		if (f) {
+			fprintf(f,
+				"#!/system/bin/sh\n"
+				"P=\"%s\"\n"
+				"name=\"\"; val=\"\"; args=0\n"
+				"for a in \"$@\"; do\n"
+				"  case \"$a\" in -*) : ;; *)\n"
+				"    args=$((args+1))\n"
+				"    [ $args -eq 1 ] && name=\"$a\"\n"
+				"    [ $args -eq 2 ] && val=\"$a\"\n"
+				"  esac\n"
+				"done\n"
+				"if [ $args -ge 2 ] && [ -n \"$name\" ]; then\n"
+				"  [ -f \"$P\" ] && sed -i \"/^$name=/d\" \"$P\"\n"
+				"  echo \"$name=$val\" >> \"$P\"\n"
+				"  exit 0\n"
+				"fi\n"
+				"if [ $args -eq 1 ] && [ -n \"$name\" ] && [ -f \"$P\" ]; then\n"
+				"  while IFS='=' read -r k v; do\n"
+				"    [ \"$k\" = \"$name\" ] && { echo \"$v\"; exit 0; }\n"
+				"  done < \"$P\"\n"
+				"fi\n"
+				"exec /system/bin/%s \"$@\"\n",
+				st, names[i]);
+			fclose(f);
+			chmod(p, 0755);
+		}
+	}
+}
+static void emit_mount_wrapper(const char *ctx_path)
+{
+	char p[PATH_MAX];
+	snprintf(p, sizeof(p), "%s/mount", ctx_path);
+	FILE *f = fopen(p, "w");
+	if (!f)
+		return;
+	fprintf(f,
+		"#!/system/bin/sh\n"
+		"W=\"%s\"\n"
+		"mkdir -p \"$W/.mnt\"\n"
+		"if echo \" $* \" | grep -q 'remount'; then\n"
+		"  rw=0; ro=0\n"
+		"  echo \" $* \" | grep -qE '(^|,)rw(,|$)' && rw=1\n"
+		"  echo \" $* \" | grep -qE '(^|,)ro(,|$)' && ro=1\n"
+		"  tgt=\n"
+		"  for a in \"$@\"; do\n"
+		"    case \"$a\" in\n"
+		"      -o|-t|*remount*|rw|ro|bind|rbind|none|ext4|f2fs|erofs) : ;;\n"
+		"      *) tgt=\"$a\" ;;\n"
+		"    esac\n"
+		"  done\n"
+		"  [ -n \"$tgt\" ] || tgt=/ \n"
+		"  comp=$(echo \"$tgt\" | sed 's#^/*##; s#/.*$##')\n"
+		"  [ -n \"$comp\" ] || comp=root\n"
+		"  if [ $rw -eq 1 ] && [ $ro -eq 0 ]; then\n"
+		"    echo 1 > \"$W/.mnt/$comp\"\n"
+		"  elif [ $ro -eq 1 ]; then\n"
+		"    rm -f \"$W/.mnt/$comp\"\n"
+		"  fi\n"
+		"  /system/bin/mount \"$@\" >/dev/null 2>&1\n"
+		"  exit 0\n"
+		"fi\n"
+		"exec /system/bin/mount \"$@\"\n",
+		g_work_dir ? g_work_dir : "/data/local/tmp/termux");
+	fclose(f);
+	chmod(p, 0755);
+}
+
+/*
+ * chcon/restorecon: real root rewrites security.selinux labels; a fake
+ * root records them into <workdir>/.xattrs/<path-with-'%'> which
+ * enter.c replays for getxattr/lgetxattr (ls -Z) while the real
+ * syscall keeps failing with EPERM.
+ */
+static void emit_chcon_wrappers(const char *ctx_path)
+{
+	char xd[PATH_MAX];
+	char p[PATH_MAX];
+	snprintf(xd, sizeof(xd), "%s/.xattrs", g_work_dir);
+
+	snprintf(p, sizeof(p), "%s/chcon", ctx_path);
+	FILE *f = fopen(p, "w");
+	if (f) {
+		fprintf(f,
+			"#!/system/bin/sh\n"
+			"X=\"%s\"\n"
+			"mkdir -p \"$X\"\n"
+			"ctx=; opts=1\n"
+			"for a in \"$@\"; do\n"
+			"  case \"$a\" in\n"
+			"    -*) : ;;\n"
+			"    *) if [ -z \"$ctx\" ]; then ctx=\"$a\"; else\n"
+			"         k=$(echo \"$a\" | sed 's#/#%%#g')\n"
+			"         case \"$k\" in %%*) k=${k#%%} ;; esac\n"
+			"         echo \"$ctx\" > \"$X/$k\"\n"
+			"       fi ;;\n"
+			"  esac\n"
+			"done\n"
+			"/system/bin/chcon \"$@\" >/dev/null 2>&1\n"
+			"exit 0\n",
+			xd);
+		fclose(f);
+		chmod(p, 0755);
+	}
+
+	snprintf(p, sizeof(p), "%s/restorecon", ctx_path);
+	f = fopen(p, "w");
+	if (f) {
+		fprintf(f,
+			"#!/system/bin/sh\n"
+			"X=\"%s\"\n"
+			"for a in \"$@\"; do\n"
+			"  case \"$a\" in\n"
+			"    -*) : ;;\n"
+			"    *) k=$(echo \"$a\" | sed 's#/#%%#g')\n"
+			"       case \"$k\" in %%*) k=${k#%%} ;; esac\n"
+			"       rm -f \"$X/$k\" ;;\n"
+			"  esac\n"
+			"done\n"
+			"/system/bin/restorecon \"$@\" >/dev/null 2>&1\n"
+			"exit 0\n",
+			xd);
+		fclose(f);
+		chmod(p, 0755);
+	}
+}
+
 static void print_help(FILE *f)
 {
 	fprintf(f,
@@ -221,6 +420,106 @@ static const char *const AID_GAPS =
 	"oem_3000:3000\n"
 	"oem_3008:3008\n"
 	"oem_3020:3020";
+static const struct { const char *user; const char *ctx; } AID_SELINUX_CTX[] = {
+	{ "system", "u:r:system_app:s0" },
+	{ "radio", "u:r:radio:s0" },
+	{ "bluetooth", "u:r:mtk_hal_bluetooth:s0" },
+	{ "wifi", "u:r:wificond:s0" },
+	{ "media", "u:r:mediametrics:s0" },
+	{ "keystore", "u:r:keystore:s0" },
+	{ "drm", "u:r:drmserver:s0" },
+	{ "gps", "u:r:mnld:s0" },
+};
+static bool valid_uint_str(const char *s, long *out);
+static const char *aid_name_for_uid(long uid, char *name, size_t namesz)
+{
+	char *table = strdup(AID_USERS);
+	if (table == NULL)
+		return NULL;
+	char *save = NULL;
+	const char *res = NULL;
+	for (char *line = strtok_r(table, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		char *colon = strchr(line, ':');
+		if (colon == NULL)
+			continue;
+		long v;
+		if (valid_uint_str(colon + 1, &v) && v == uid) {
+			size_t n = (size_t)(colon - line);
+			if (n >= namesz)
+				n = namesz - 1;
+			memcpy(name, line, n);
+			name[n] = '\0';
+			res = name;
+			break;
+		}
+	}
+	free(table);
+	return res;
+}
+static int run_cmd_capture_argv(const char *path, const char *arg1, const char *arg2, char **out, size_t *outlen);
+static const char *selinux_ctx_for_user(const char *user)
+{
+	/* resolve name like uid/gid resolution does: numeric -> AID_USERS name */
+	const char *name = user;
+	char namebuf[64];
+	if (name != NULL && name[0] != '\0' && isdigit((unsigned char)name[0])) {
+		long u;
+		if (valid_uint_str(name, &u) && aid_name_for_uid(u, namebuf, sizeof(namebuf)))
+			name = namebuf;
+	}
+	if (name == NULL || name[0] == '\0' || strcmp(name, "root") == 0)
+		return "u:r:kernel:s0";
+	if (strcmp(name, "shell") == 0)
+		return "u:r:shell:s0";
+
+	/* real-time context list: scan ps -Z -A for the target user */
+	char exact_ctx[96];
+	snprintf(exact_ctx, sizeof(exact_ctx), "u:r:%s:s0", name);
+	static char g_ctx_buf[128];
+	g_ctx_buf[0] = '\0';
+	char *out = NULL;
+	size_t outlen = 0;
+	if (run_cmd_capture_argv("/system/bin/ps", "-Z", "-A", &out, &outlen) == 0 && out != NULL) {
+		char *copy = strdup(out);
+		free(out);
+		if (copy != NULL) {
+			const char *pref = NULL, *first = NULL;
+			char *lsave = NULL;
+			for (char *line = strtok_r(copy, "\n", &lsave); line; line = strtok_r(NULL, "\n", &lsave)) {
+				if (strncmp(line, "u:r:", 4) != 0)
+					continue;
+				char *psave = NULL;
+				char *label = strtok_r(line, " ", &psave);
+				char *uname = strtok_r(NULL, " ", &psave);
+				if (label == NULL || uname == NULL)
+					continue;
+				if (strcmp(uname, name) != 0)
+					continue;
+				if (strcmp(label, exact_ctx) == 0) {
+					snprintf(g_ctx_buf, sizeof(g_ctx_buf), "%s", label);
+					break;
+				}
+				if (strncmp(label + 4, name, strlen(name)) == 0 && pref == NULL)
+					pref = label;
+				if (first == NULL)
+					first = label;
+			}
+			if (g_ctx_buf[0] == '\0') {
+				const char *chosen = pref != NULL ? pref : first;
+				if (chosen != NULL)
+					snprintf(g_ctx_buf, sizeof(g_ctx_buf), "%s", chosen);
+			}
+			free(copy);
+			if (g_ctx_buf[0] != '\0')
+				return g_ctx_buf;
+		}
+	}
+	/* fallback: static table */
+	for (size_t i = 0; i < sizeof(AID_SELINUX_CTX)/sizeof(AID_SELINUX_CTX[0]); i++)
+		if (strcmp(AID_SELINUX_CTX[i].user, name) == 0)
+			return AID_SELINUX_CTX[i].ctx;
+	return "u:r:shell:s0";
+}
 static bool valid_uint_str(const char *s, long *out)
 {
 	size_t len = strlen(s);
@@ -748,6 +1047,25 @@ static void copy_file(const char *src, const char *dst)
 	close(out);
 	close(in);
 }
+static void write_embedded(const char *path, const unsigned char *start, const unsigned char *end)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	if (fd < 0)
+		return;
+	const unsigned char *p = start;
+	size_t left = (size_t)(end - start);
+	while (left > 0) {
+		ssize_t n = write(fd, p, left);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		p += n;
+		left -= (size_t)n;
+	}
+	close(fd);
+}
 static void ensure_libs(void)
 {
 	char libdir[PATH_MAX];
@@ -759,7 +1077,7 @@ static void ensure_libs(void)
 	snprintf(ncu_sym, sizeof(ncu_sym), "%s/libncursesw.so", libdir);
 	snprintf(iconv_src, sizeof(iconv_src), "%s/libiconv.so", libdir);
 	struct stat st_ncu;
-	if (stat(ncu, &st_ncu) != 0) {
+	if (stat(ncu65, &st_ncu) != 0) {
 		const char *srcs[2];
 		char self_lib[PATH_MAX];
 		snprintf(self_lib, sizeof(self_lib), "%s/lib", g_self_dir);
@@ -772,32 +1090,37 @@ static void ensure_libs(void)
 			if (stat(s65, &st) != 0)
 				continue;
 			copy_file(s65, ncu65);
-			symlink("libncursesw.so.6.5", ncu);
-			symlink("libncursesw.so.6", ncu_sym);
 			char sico[PATH_MAX];
 			snprintf(sico, sizeof(sico), "%s/libiconv.so", srcs[i]);
 			if (stat(sico, &st) == 0)
 				copy_file(sico, iconv_src);
 			break;
 		}
-	} else {
-		struct stat st_iconv;
-		if (stat(iconv_src, &st_iconv) != 0) {
-			const char *srcs[2];
-			char self_lib[PATH_MAX];
-			snprintf(self_lib, sizeof(self_lib), "%s/lib", g_self_dir);
-			srcs[0] = self_lib;
-			srcs[1] = "/data/data/com.termux/files/usr/lib";
-			for (int i = 0; i < 2; i++) {
-				char sico[PATH_MAX];
-				snprintf(sico, sizeof(sico), "%s/libiconv.so", srcs[i]);
-				struct stat st;
-				if (stat(sico, &st) == 0) {
-					copy_file(sico, iconv_src);
-					break;
-				}
+		if (stat(ncu65, &st_ncu) != 0)
+			write_embedded(ncu65, _binary_libncursesw_so_6_5_start, _binary_libncursesw_so_6_5_end);
+	} else if (stat(iconv_src, &st_ncu) != 0) {
+		const char *srcs[2];
+		char self_lib[PATH_MAX];
+		snprintf(self_lib, sizeof(self_lib), "%s/lib", g_self_dir);
+		srcs[0] = self_lib;
+		srcs[1] = "/data/data/com.termux/files/usr/lib";
+		for (int i = 0; i < 2; i++) {
+			char sico[PATH_MAX];
+			snprintf(sico, sizeof(sico), "%s/libiconv.so", srcs[i]);
+			struct stat st;
+			if (stat(sico, &st) == 0) {
+				copy_file(sico, iconv_src);
+				break;
 			}
 		}
+		if (stat(iconv_src, &st_ncu) != 0)
+			write_embedded(iconv_src, _binary_libiconv_so_start, _binary_libiconv_so_end);
+	}
+	if (stat(ncu65, &st_ncu) == 0) {
+		unlink(ncu);
+		unlink(ncu_sym);
+		symlink("libncursesw.so.6.5", ncu);
+		symlink("libncursesw.so.6", ncu_sym);
 	}
 }
 static void aid_files_setup(void)
@@ -892,6 +1215,81 @@ static void setup_ld_library_path(void)
 		snprintf(ld, sizeof(ld), "%s", libdir);
 	setenv_str("LD_LIBRARY_PATH", ld);
 }
+static void gen_fake_status(void)
+{
+	/* Fuse: transplant of thj_ptrace's build_fake_status().  Snapshot the
+	 * supervisor's own /proc/self/status and rewrite the root-visible
+	 * fields (Uid/Gid/Groups/Context/Cap*), so reads of /proc/self/status
+	 * (grep, bash $'', python) look like a real root session. */
+	char line[1024];
+	char *buf = malloc(16384);
+	if (!buf)
+		return;
+	size_t cap = 16384, n = 0;
+	buf[0] = '\0';
+	FILE *f = fopen("/proc/self/status", "r");
+	if (!f) { free(buf); return; }
+	const char *ctx = (g_selinux_ctx && g_selinux_ctx[0]) ? g_selinux_ctx : "u:r:shell:s0";
+	while (fgets(line, sizeof(line), f)) {
+		const char *repl = NULL;
+		char uidbuf[64], gidbuf[64], grpbuf[512];
+		if      (strncmp(line, "Name:", 5) == 0) {
+			char nb[64];
+			snprintf(nb, sizeof(nb), "Name:\t%s\n", g_fake_name);
+			repl = nb;
+		} else if (strncmp(line, "PPid:", 5) == 0) {
+			/* A real root shell has no survivable parent chain to
+			 * follow: seed the session as owned by pid 0. */
+			repl = "PPid:\t0\n";
+		} else if (strncmp(line, "Uid:", 4) == 0) {
+			snprintf(uidbuf, sizeof(uidbuf), "Uid:\t%ld\t%ld\t%ld\t%ld\n",
+				 g_uid, g_uid, g_uid, g_uid);
+			repl = uidbuf;
+		} else if (strncmp(line, "Gid:", 4) == 0) {
+			snprintf(gidbuf, sizeof(gidbuf), "Gid:\t%ld\t%ld\t%ld\t%ld\n",
+				 g_gid, g_gid, g_gid, g_gid);
+			repl = gidbuf;
+		} else if (strncmp(line, "Groups:", 7) == 0) {
+			int glen = snprintf(grpbuf, sizeof(grpbuf), "Groups:\t%ld", g_gid);
+			for (size_t k = 0; k < g_suppg_cnt && glen < (int)sizeof(grpbuf) - 8; k++) {
+				long sv;
+				if (valid_uint_str(g_suppg[k], &sv) && sv != g_gid)
+					glen += snprintf(grpbuf + glen, sizeof(grpbuf) - (size_t)glen, " %ld", sv);
+			}
+			snprintf(grpbuf + glen, sizeof(grpbuf) - (size_t)glen, "\n");
+			repl = grpbuf;
+		} else if (strncmp(line, "Context:", 8) == 0) {
+			char tmp[512];
+			snprintf(tmp, sizeof(tmp), "Context:\t%s\n", ctx);
+			repl = tmp;
+		} else if (strncmp(line, "CapInh:", 7) == 0)
+			repl = "CapInh:\t0000000000000000\n";
+		else if (strncmp(line, "CapPrm:", 7) == 0)
+			repl = "CapPrm:\t000001ffffffffff\n";
+		else if (strncmp(line, "CapEff:", 7) == 0)
+			repl = "CapEff:\t000001ffffffffff\n";
+		else if (strncmp(line, "CapBnd:", 7) == 0)
+			repl = "CapBnd:\t000001ffffffffff\n";
+		else if (strncmp(line, "CapAmb:", 7) == 0)
+			repl = "CapAmb:\t000001ffffffffff\n";
+		const char *use = repl ? repl : line;
+		size_t l = strlen(use);
+		if (n + l < cap) {
+			memcpy(buf + n, use, l);
+			n += l;
+		}
+	}
+	fclose(f);
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/status", g_work_dir);
+	FILE *sf = fopen(path, "w");
+	if (sf) {
+		fwrite(buf, 1, n, sf);
+		fclose(sf);
+	}
+	free(buf);
+}
+
 static void build_and_run_proot(void)
 {
 	bool enoexec_case = false;
@@ -899,11 +1297,11 @@ static void build_and_run_proot(void)
 	const char *shell_argv0 = g_shell;
 	if (strcmp(g_shell, DEFAULT_SHELL) == 0) {
 		/*
-		 * Prefer the embedded bash for the session shell so the TerHijack
-		 * runtime (arrays, declare, +=) can be eval'd. Android's real
-		 * /system/bin/sh is mksh, which rejects bash syntax with
-		 * "syntax error: unexpected '('" and silently disables every hook.
-		 * argv0 stays "/system/bin/sh" so ps/comm look stock.
+		 * $SHELL was unusable (or absent): fall back to our embedded
+		 * bash as the auxiliary session shell.  It carries the stock
+		 * argv0 "/system/bin/sh" so ps/comm keep looking like the
+		 * device's default mksh (TerHijack hooks need bash syntax the
+		 * real mksh would reject with "syntax error: unexpected ('").
 		 */
 		struct stat st;
 		char embedded[PATH_MAX];
@@ -912,6 +1310,11 @@ static void build_and_run_proot(void)
 			shell = strdup(embedded);
 			shell_argv0 = "/system/bin/sh";
 		}
+	}
+	if (shell != g_shell) {
+		strncpy(g_proot_argv0, shell_argv0, sizeof(g_proot_argv0) - 1);
+		g_proot_argv0[sizeof(g_proot_argv0) - 1] = '\0';
+		g_proot_argv0_fix = 1;
 	}
 	int rc = shell_validate(shell);
 	if (rc == 1)
@@ -942,16 +1345,94 @@ static void build_and_run_proot(void)
 		}
 	}
 	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+		/* The ctx file is consumed via the AFAKESU /proc redirect
+		 * (readlink_proc "attr/*" self-binding), NOT a proot bind:
+		 * a bind would let stat() show the plain file (size 14,
+		 * mode 1777) instead of a procfs-shaped entry. */
 		char ctx_path[PATH_MAX];
 		snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
 		FILE *cf = fopen(ctx_path, "w");
 		if (cf) {
 			fprintf(cf, "%s\n", g_selinux_ctx);
 			fclose(cf);
-			char *b = malloc(strlen(g_work_dir) + 128);
-			sprintf(b, "-b %s/ctx:/proc/self/attr/current", g_work_dir);
-			binds[bind_cnt++] = b;
 		}
+	}
+	{
+		/* Fuse: the workdir fake-status file is redirected by proc.c's
+		 * readlink_proc (component "status"), not by a proot bind: binds
+		 * can't match /proc paths because self/thread-self canonicalize
+		 * to /proc/<pid>, which is unknown at bind time. */
+		struct stat sst;
+		char st[PATH_MAX];
+		snprintf(st, sizeof(st), "%s/status", g_work_dir);
+		if (stat(st, &sst) != 0 || sst.st_size <= 0)
+			gen_fake_status();
+
+		/* Symlink used by enter.c to answer readlink("/proc/1/exe"). */
+		char exe1[PATH_MAX];
+		snprintf(exe1, sizeof(exe1), "%s/.exe1", g_work_dir);
+		unlink(exe1);
+		symlink("/system/bin/init", exe1);
+
+		/* Fake kernel cmdline, substituted for the unreadable /proc/cmdline. */
+		char cmd[PATH_MAX];
+		snprintf(cmd, sizeof(cmd), "%s/.cmdline", g_work_dir);
+		struct stat cst;
+		if (stat(cmd, &cst) != 0 || cst.st_size <= 0) {
+			FILE *mf = fopen(cmd, "w");
+			if (mf) {
+				fprintf(mf, "androidboot.hardware=qcom androidboot.bootdevice=soc/1d84000.ufshc "
+					"androidboot.selinux=enforcing androidboot.verifiedbootstate=green "
+					"androidboot.veritymode=enforcing console=ttyMSM0,115200n8 "
+					"androidboot.serialno=XHA0123456 buildvariant=user\n");
+				fclose(mf);
+				chmod(cmd, 0444);
+			}
+		}
+
+		/* SELinux global enforce state, substituted for the gated
+		 * read of /sys/fs/selinux/enforce. */
+		char enf[PATH_MAX];
+		snprintf(enf, sizeof(enf), "%s/.enforce", g_work_dir);
+		struct stat est;
+		if (stat(enf, &est) != 0 || est.st_size <= 0) {
+			FILE *ef = fopen(enf, "w");
+			if (ef) {
+				fprintf(ef, "1\n");
+				fclose(ef);
+				chmod(enf, 0444);
+			}
+		}
+
+		/* Writtable-overlay root, plus the per-partition rw markers
+		 * that model "mount -o remount,rw <part>".  A rooted phone
+		 * ships system/vendor/product/odm already writable (Magisk),
+		 * so seed them the same way. */
+		char ovdir[PATH_MAX];
+		snprintf(ovdir, sizeof(ovdir), "%s/ov", g_work_dir);
+		mkdir(ovdir, 0755);
+
+		char mntd[PATH_MAX];
+		snprintf(mntd, sizeof(mntd), "%s/.mnt", g_work_dir);
+		mkdir(mntd, 0755);
+		static const char *def_roots[] = { "system", "vendor", "product", "odm", "root" };
+		size_t di;
+		for (di = 0; di < sizeof(def_roots) / sizeof(def_roots[0]); di++) {
+			char mr[PATH_MAX];
+			snprintf(mr, sizeof(mr), "%s/.mnt/%s", g_work_dir, def_roots[di]);
+			if (access(mr, F_OK) != 0) {
+				FILE *f = fopen(mr, "w");
+				if (f) {
+					fputs("1\n", f);
+					fclose(f);
+				}
+			}
+		}
+
+		/* chcon/restorecon label store consumed by enter.c. */
+		char xad[PATH_MAX];
+		snprintf(xad, sizeof(xad), "%s/.xattrs", g_work_dir);
+		mkdir(xad, 0755);
 	}
 	char idbuf[64];
 	const char *id_arg[2];
@@ -972,7 +1453,8 @@ static void build_and_run_proot(void)
 		snprintf(tmppath, sizeof(tmppath), "%s/bin", g_work_dir);
 		const char *cur = getenv("PATH");
 		char path_env[PATH_MAX];
-		snprintf(path_env, sizeof(path_env), "%s:%s", tmppath, cur ? cur : ANDROID_PATH);
+		snprintf(path_env, sizeof(path_env), "%s:/sbin:/system/bin:/system/xbin:/system/sbin:%s",
+			 tmppath, cur ? cur : ANDROID_PATH);
 		setenv_str("PATH", path_env);
 		if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
 			char ctx_path[PATH_MAX];
@@ -982,16 +1464,50 @@ static void build_and_run_proot(void)
 			snprintf(id_wrapper, sizeof(id_wrapper), "%s/id", ctx_path);
 			FILE *f = fopen(id_wrapper, "w");
 			if (f) {
-				fprintf(f, "#!/system/bin/sh\n"
-					"case \"$*\" in *-Z*) echo '%s' ;; *) exec /system/bin/id \"$@\" ;; esac\n",
-					g_selinux_ctx);
+				emit_id_wrapper(f, g_selinux_ctx);
 				fclose(f);
 				chmod(id_wrapper, 0755);
+			}
+			/* dmesg: the kernel log is gated by CAP_SYSLOG; a fake kernel
+			 * domain answers it like real root would, with plausible output. */
+			char dm_path[PATH_MAX];
+			snprintf(dm_path, sizeof(dm_path), "%s/dmesg", ctx_path);
+			FILE *df = fopen(dm_path, "w");
+			if (df) {
+				fprintf(df,
+					"#!/system/bin/sh\n"
+					"for line in \\\n"
+					"'[    0.000000] Booting Linux on physical CPU 0x0000000000' \\\n"
+					"'[    0.000000] Linux version 5.15.94-android13-8-g0000000 (build@unknown) #1 SMP PREEMPT' \\\n"
+					"'[    0.000000] Kernel command line: androidboot.hardware=qcom androidboot.selinux=enforcing androidboot.verifiedbootstate=green' \\\n"
+					"'[    0.020062] cgroup: cgroup2 opened' \\\n"
+					"'[    1.721900] init: starting service 'zygote'...' \\\n"
+					"'[    5.412501] mmc0: new card done' \\\n"
+					"'[    9.103812] binder: 512:512 ioctl 4 4c00 fe01 returned 0' \\\n"
+					"'[   12.736114] init: Starting service 'audioserver'...' \\\n"
+					"'[   16.002313] init: Starting service 'surfaceflinger'...'\n"
+					"do echo \"$line\"; done\n"
+					"exit 0\n");
+				fclose(df);
+				chmod(dm_path, 0755);
+			}
+			/* getenforce: the read of /sys/fs/selinux/enforce is gated
+			 * by SELinux itself; a policy-loaded kernel answers. */
+			char ge_path[PATH_MAX];
+			snprintf(ge_path, sizeof(ge_path), "%s/getenforce", ctx_path);
+			FILE *gf = fopen(ge_path, "w");
+			if (gf) {
+				fprintf(gf, "#!/system/bin/sh\necho Enforcing\nexit 0\n");
+				fclose(gf);
+				chmod(ge_path, 0755);
 			}
 			char path_env[PATH_MAX];
 			const char *cur = getenv("PATH");
 			snprintf(path_env, sizeof(path_env), "%s:%s", ctx_path, cur ? cur : ANDROID_PATH);
 			setenv_str("PATH", path_env);
+			emit_prop_wrappers(ctx_path);
+			emit_mount_wrapper(ctx_path);
+			emit_chcon_wrappers(ctx_path);
 		}
 		char home[64];
 		if (g_uid == 0)
@@ -1059,11 +1575,11 @@ static void build_and_run_proot(void)
 	}
 	if (g_cmd != NULL) {
 		argv[argc++] = "-c";
-		char *wrapped = malloc(strlen(g_cmd) + 1024);
+char *wrapped = malloc(strlen(g_cmd) + 1024);
 		if (wrapped) {
 			char thpath[PATH_MAX];
 			snprintf(thpath, sizeof(thpath), "%s/terhijack", g_work_dir);
-			snprintf(wrapped, 1024,
+			snprintf(wrapped, strlen(g_cmd) + 1024,
 				"export __THJ_BIN=%s && "
 				"eval \"$(%s --init 2>/dev/null)\" && "
 				"eval \"$(%s -c 'id -Z' -o '%s' 2>/dev/null)\" && "
@@ -1073,8 +1589,9 @@ static void build_and_run_proot(void)
 				"eval \"$(%s -c 'getenforce' -o 'Enforcing' 2>/dev/null)\" && "
 				"%s",
 				thpath, thpath,
+				g_selinux_ctx ? g_selinux_ctx : "u:r:shell:s0",
 				thpath, g_selinux_ctx ? g_selinux_ctx : "u:r:shell:s0",
-				thpath, g_selinux_ctx ? g_selinux_ctx : "u:r:shell:s0",
+				thpath,
 				thpath,
 				thpath,
 				thpath,
@@ -1360,6 +1877,12 @@ static void parse_options(int argc, char **argv)
 }
 int main(int argc, char **argv)
 {
+	if (argc > 0 && argv[0] != NULL) {
+		size_t alen = strlen(argv[0]);
+		if (alen > 1)
+			strncpy(argv[0], "su", alen);
+	}
+	prctl(PR_SET_NAME, "su");
 	ssize_t n = readlink("/proc/self/exe", g_self_exe, sizeof(g_self_exe) - 1);
 	if (n < 0)
 		n = 0;
@@ -1428,6 +1951,8 @@ int main(int argc, char **argv)
 		g_gid = v;
 	}
 	ensure_current_uid_in_files();
+	if (g_selinux_ctx == NULL)
+		g_selinux_ctx = selinux_ctx_for_user(user);
 	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
 		char ctx_path[PATH_MAX];
 		snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
@@ -1440,12 +1965,46 @@ int main(int argc, char **argv)
 		snprintf(idf, sizeof(idf), "%s/id", idp);
 		FILE *f = fopen(idf, "w");
 		if (f) {
-			fprintf(f, "#!/system/bin/sh\n"
-				"/system/bin/id -G root\n"
-				"exec /system/bin/id \"$@\"\n");
+			emit_id_wrapper(f, g_selinux_ctx);
 			fclose(f); chmod(idf, 0755);
 		}
 	}
+	{
+		/*
+		 * Session shell = the caller's current shell ($SHELL), so the
+		 * su session runs the user's real environment; the embedded bash
+		 * is only an auxiliary fallback (unset/unusable $SHELL).  The
+		 * stock /system/bin/sh (mksh) would reject the bash-only TerHijack
+		 * hook scripts, hence the embedded fallback keeps argv0 "/system/bin/sh".
+		 * The $SHELL binary must be executable by the *current* run user
+		 * (a termux-private 0700 bash is not, under rishq's uid 2000).
+		 */
+		const char *env_shell = getenv("SHELL");
+		if (strcmp(g_shell, DEFAULT_SHELL) == 0
+		    && env_shell != NULL && env_shell[0] != '\0'
+		    && strcmp(env_shell, DEFAULT_SHELL) != 0
+		    && strcmp(env_shell, "/bin/sh") != 0) {
+			/* A "sh"-named shell is the stock mksh (it rejects the
+			 * bash-only TerHijack hooks): treat it as the default and
+			 * let the embedded bash stay as the auxiliary session
+			 * shell.  Any other current shell that is executable by
+			 * the current run user wins. */
+			const char *bn = strrchr(env_shell, '/');
+			bn = bn ? bn + 1 : env_shell;
+			if (strcmp(bn, "sh") != 0 && access(env_shell, X_OK) == 0)
+				g_shell = env_shell;
+		}
+	}
+	{
+		const char *s = g_shell;
+		if (s == NULL || strcmp(s, DEFAULT_SHELL) == 0)
+			g_fake_name = "sh";
+		else {
+			const char *p = strrchr(s, '/');
+			g_fake_name = (p && p[1]) ? p + 1 : s;
+		}
+	}
+	gen_fake_status();
 	if (g_tgt != NULL)
 		fprintf(stderr, "su: taking mount namespace of PID %s\n", g_tgt);
 	if (g_mount)

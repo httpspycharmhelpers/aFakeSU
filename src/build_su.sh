@@ -40,6 +40,14 @@ $CC -O2 -std=c99 -o "$BLD/terhijack.bin" "$ROOT/terhijack.c" || exit 1
     --rename-section .data=.rodata,alloc,load,readonly,data,contents \
     terhijack.bin terhijack.bin.o) || exit 1
 
+echo "== embedded libs (libiconv / libncursesw) =="
+for lib in libiconv.so libncursesw.so.6.5; do
+    cp "/data/data/com.termux/files/usr/lib/$lib" "$BLD/$lib"
+    (cd "$BLD" && objcopy -I binary -O elf64-littleaarch64 -B aarch64 \
+        --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+        "$lib" "$lib.o") || exit 1
+done
+
 echo "== su.o =="
 $CC -c $COMMON -I"$PT" -I"$PT/src" \
     "$ROOT/su.c" -o "$BLD/su.o" || exit 1
@@ -55,6 +63,7 @@ done < <(find "$PT/src" -name "*.o" | sort)
 
 $CC -o "$ROOT/fakesu.elf" \
     "$BLD/cli.o" $OBJS "$BLD/talloc.o" "$BLD/shmem.o" "$BLD/su.o" "$BLD/bash.bin.o" "$BLD/terhijack.bin.o" \
+    "$BLD/libiconv.so.o" "$BLD/libncursesw.so.6.5.o" \
     -Wl,-z,noexecstack -llog || exit 1
 
 echo "== done: $ROOT/fakesu.elf =="
