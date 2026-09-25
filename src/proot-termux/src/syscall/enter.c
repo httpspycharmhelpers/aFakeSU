@@ -382,6 +382,269 @@ static const char *afakesu_read_session_ctx(void)
 	return ctx;
 }
 
+static bool afakesu_valid_uint(const char *s, long *out)
+{
+	if (s == NULL || *s == '\0')
+		return false;
+	char *end;
+	long v = strtol(s, &end, 10);
+	if (*end != '\0')
+		return false;
+	*out = v;
+	return true;
+}
+
+static bool afakesu_is_pid_match(const Tracee *tracee, const char *pidp);
+
+/* Regenerate the workdir "status" stand-in from the *requesting* tracee's
+ * own /proc/<pid>/status, so every reader sees its real Name, memory,
+ * threads etc. while the identity fields are patched to the persona. */
+static void afakesu_regen_status_for_pid(pid_t pid)
+{
+	char spath[64], line[1024];
+	FILE *f;
+
+	snprintf(spath, sizeof(spath), "/proc/%d/status", pid);
+	f = fopen(spath, "r");
+	if (f == NULL)
+		return;
+
+	long uid = 0, gid = 0;
+	{
+		char up[PATH_MAX];
+		snprintf(up, sizeof(up), "%s/.uidgid", g_work_dir);
+		FILE *uf = fopen(up, "r");
+		if (uf != NULL) {
+			if (fscanf(uf, "%ld:%ld", &uid, &gid) != 2) {
+				uid = 0;
+				gid = 0;
+			}
+			fclose(uf);
+		}
+	}
+
+	char grps[1024];
+	grps[0] = '\0';
+	{
+		char gp[PATH_MAX];
+		snprintf(gp, sizeof(gp), "%s/.ugroups", g_work_dir);
+		FILE *gf = fopen(gp, "r");
+		if (gf != NULL) {
+			while (fgets(line, sizeof(line), gf) != NULL) {
+				char *colon = strchr(line, ':');
+				if (colon == NULL)
+					continue;
+				long u;
+				char *end;
+				u = strtol(line, &end, 10);
+				if (end != colon || u != uid)
+					continue;
+				char *save = NULL;
+				size_t glen = 0;
+				for (char *tok = strtok_r(colon + 1, " \t\r\n", &save);
+				     tok != NULL;
+				     tok = strtok_r(NULL, " \t\r\n", &save)) {
+					long gv;
+					if (!afakesu_valid_uint(tok, &gv) || gv < 0)
+						continue;
+					if (uid != 0 && gv == gid)
+						continue;
+					if (uid == 0 && gv == gid && glen > 0)
+						continue;
+					glen += snprintf(grps + glen, sizeof(grps) - (size_t)glen,
+							glen ? " %s" : "%s", tok);
+				}
+				break;
+			}
+			fclose(gf);
+		}
+	}
+	if (uid == 0 && grps[0] == '\0')
+		strcpy(grps, "0");
+
+	const char *ctx = afakesu_read_session_ctx();
+	if (ctx == NULL)
+		ctx = uid == 0 ? "u:r:su:s0" : "u:r:shell:s0";
+
+	char *buf = malloc(32768);
+	if (buf == NULL) {
+		fclose(f);
+		return;
+	}
+	size_t cap = 32768, n = 0;
+	buf[0] = '\0';
+	while (fgets(line, sizeof(line), f) != NULL) {
+		const char *repl = NULL;
+		char uidbuf[64], gidbuf[64], grpbuf[1024], ctxbuf[512];
+		if (strncmp(line, "Uid:", 4) == 0) {
+			snprintf(uidbuf, sizeof(uidbuf), "Uid:\t%ld\t%ld\t%ld\t%ld\n",
+				 uid, uid, uid, uid);
+			repl = uidbuf;
+		} else if (strncmp(line, "Name:", 5) == 0) {
+			/* The session interpreter is the Termux bash we ship,
+			 * but the persona is a stock su shell: report "sh" so
+			 * Name matches the faked /proc/<pid>/exe.  Any other
+			 * command keeps its own real name. */
+			const char *nm = line + 5;
+			while (*nm == '\t' || *nm == ' ')
+				nm++;
+			if (strncmp(nm, "bash", 4) == 0
+			    && (nm[4] == '\n' || nm[4] == '\0')) {
+				char nbuf[80];
+				extern char g_fake_comm[64];
+				snprintf(nbuf, sizeof(nbuf), "Name:\t%s\n", g_fake_comm);
+				repl = nbuf;
+			}
+		} else if (strncmp(line, "State:", 6) == 0) {
+			/* Being ptrace-stopped while reading is a PRoot tell. */
+			repl = "State:\tR (running)\n";
+		} else if (strncmp(line, "TracerPid:", 10) == 0)
+			repl = "TracerPid:\t0\n";
+		else if (strncmp(line, "Gid:", 4) == 0) {
+			snprintf(gidbuf, sizeof(gidbuf), "Gid:\t%ld\t%ld\t%ld\t%ld\n",
+				 gid, gid, gid, gid);
+			repl = gidbuf;
+		} else if (strncmp(line, "Groups:", 7) == 0) {
+			snprintf(grpbuf, sizeof(grpbuf), "Groups:\t%s\n", grps);
+			repl = grpbuf;
+		} else if (strncmp(line, "Context:", 8) == 0) {
+			snprintf(ctxbuf, sizeof(ctxbuf), "Context:\t%s\n", ctx);
+			repl = ctxbuf;
+		} else if (strncmp(line, "CapInh:", 7) == 0) {
+			repl = "CapInh:\t0000000000000000\n";
+		} else if (strncmp(line, "CapPrm:", 7) == 0) {
+			repl = uid == 0
+				? "CapPrm:\t000001ffffffffff\n"
+				: "CapPrm:\t0000000000000000\n";
+		} else if (strncmp(line, "CapEff:", 7) == 0) {
+			repl = uid == 0
+				? "CapEff:\t000001ffffffffff\n"
+				: "CapEff:\t0000000000000000\n";
+		} else if (strncmp(line, "CapBnd:", 7) == 0) {
+			repl = uid == 0
+				? "CapBnd:\t000001ffffffffff\n"
+				: "CapBnd:\t0000000000000000\n";
+		} else if (strncmp(line, "CapAmb:", 7) == 0) {
+			repl = uid == 0
+				? "CapAmb:\t0000000000000000\n"
+				: "CapAmb:\t0000000000000000\n";
+		}
+		const char *use = repl ? repl : line;
+		size_t l = strlen(use);
+		if (n + l < cap) {
+			memcpy(buf + n, use, l);
+			n += l;
+		}
+	}
+	fclose(f);
+	char st[PATH_MAX];
+	snprintf(st, sizeof(st), "%s/status", g_work_dir);
+	FILE *sf = fopen(st, "w");
+	if (sf != NULL) {
+		fwrite(buf, 1, n, sf);
+		fclose(sf);
+	}
+	free(buf);
+}
+
+/* AFAKESU: the raw /proc/<pid>/maps exposes the PRoot bootstrap file
+ * (<workdir>/prooted-<pid>-XXXXXX) which is a dead giveaway the process
+ * is running under PRoot from Termux.  Serve a scrubbed copy where every
+ * mapping whose pathname points into the Termux tree (or the prooted
+ * temp file) is reported as the faked session executable. */
+static void afakesu_regen_maps_for_pid(pid_t pid)
+{
+	char spath[64], line[2048];
+	FILE *f;
+
+	snprintf(spath, sizeof(spath), "/proc/%d/maps", pid);
+	f = fopen(spath, "r");
+	if (f == NULL)
+		return;
+
+	const size_t cap = 262144;
+	char *buf = malloc(cap);
+	if (buf == NULL) {
+		fclose(f);
+		return;
+	}
+	size_t n = 0;
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		unsigned long start, end, offset, inode;
+		char perms[8], dev[16];
+		int used = 0;
+		char *path;
+
+		if (sscanf(line, "%lx-%lx %7s %lx %15s %lu%n",
+			   &start, &end, perms, &offset, dev, &inode, &used) != 6)
+			continue;
+		path = line + used;
+		while (*path == ' ')
+			path++;
+
+		if (strstr(path, "com.termux") != NULL
+		    || strstr(path, "prooted") != NULL
+		    || strstr(path, g_work_dir) != NULL) {
+			char rebuilt[2048];
+			int h = snprintf(rebuilt, sizeof(rebuilt),
+					 "%.*s/system/bin/sh\n",
+					 (int)(path - line), line);
+			if (h > 0 && (size_t) h < sizeof(rebuilt)) {
+				strcpy(line, rebuilt);
+			}
+		}
+
+		size_t l = strlen(line);
+		if (n + l < cap) {
+			memcpy(buf + n, line, l);
+			n += l;
+		}
+	}
+	fclose(f);
+
+	char st[PATH_MAX];
+	snprintf(st, sizeof(st), "%s/maps", g_work_dir);
+	FILE *sf = fopen(st, "w");
+	if (sf != NULL) {
+		fwrite(buf, 1, n, sf);
+		fclose(sf);
+	}
+	free(buf);
+}
+
+static void afakesu_regen_pending_status(const Tracee *tracee, const char *path)
+{
+	const char *tail;
+
+	if (strncmp(path, "/proc/", 6) != 0)
+		return;
+	tail = path + 6;
+	if (strcmp(tail, "self/status") == 0
+	    || strcmp(tail, "thread-self/status") == 0) {
+		afakesu_regen_status_for_pid(tracee->pid);
+		return;
+	}
+	if (strcmp(tail, "self/maps") == 0
+	    || strcmp(tail, "thread-self/maps") == 0) {
+		afakesu_regen_maps_for_pid(tracee->pid);
+		return;
+	}
+	const char *sl = strchr(tail, '/');
+	if (sl == NULL || (strcmp(sl, "/status") != 0 && strcmp(sl, "/maps") != 0))
+		return;
+	size_t n = (size_t)(sl - tail);
+	if (n == 0 || n >= 16)
+		return;
+	if (!afakesu_is_pid_match(tracee, tail))
+		return;
+	pid_t p = (pid_t)atoi(tail);
+	if (strcmp(sl, "/status") == 0)
+		afakesu_regen_status_for_pid(p);
+	else
+		afakesu_regen_maps_for_pid(p);
+}
+
 static bool afakesu_attr_name_is_selinux(const char *name)
 {
 	return strcmp(name, "current") == 0
@@ -392,37 +655,47 @@ static bool afakesu_attr_name_is_selinux(const char *name)
 		|| strcmp(name, "sockcreate") == 0;
 }
 
+static bool afakesu_is_pid_match(const Tracee *tracee, const char *pidp)
+{
+	char pidbuf[32];
+	const char *sl = strchr(pidp, '/');
+	size_t n = (sl == NULL) ? strlen(pidp) : (size_t) (sl - pidp);
+	pid_t p;
+
+	if (n == 0 || n >= sizeof(pidbuf))
+		return false;
+	memcpy(pidbuf, pidp, n);
+	pidbuf[n] = '\0';
+	p = (pid_t) atoi(pidbuf);
+	if (p == tracee->pid)
+		return true;
+	/* An in-session peer: any pid hosted by this PRoot (the shell,
+	 * ps, awk, ... ) must also answer like root, so `ps -AZ` shows
+	 * our whole tree with the session context while foreign
+	 * processes keep their real label. */
+	return get_tracee(tracee, p, false) != NULL;
+}
+
 static bool afakesu_is_own_attr_path(const Tracee *tracee, const char *path)
 {
 	const char *pidp;
-	const char *slash;
 
 	if (strncmp(path, "/proc/", 6) != 0)
 		return false;
 
 	pidp = path + 6;
-	if (strncmp(pidp, "self", 4) == 0 && pidp[4] == '/')
+	if (strncmp(pidp, "self/", 5) == 0
+	 || strncmp(pidp, "thread-self/", 12) == 0)
 		return true;
-
-	slash = strchr(pidp, '/');
-	if (slash == NULL || (size_t) (slash - pidp) >= 32)
-		return false;
-	{
-		char pidbuf[32];
-		pid_t p;
-		memcpy(pidbuf, pidp, slash - pidp);
-		pidbuf[slash - pidp] = '\0';
-		p = (pid_t) atoi(pidbuf);
-		if (p == tracee->pid)
-			return true;
-		/* An in-session peer: any pid hosted by this PRoot (the shell,
-		 * ps, awk, ... ) must also answer like root, so `ps -AZ` shows
-		 * our whole tree with the session context while foreign
-		 * processes keep their real label. */
-		if (get_tracee(tracee, p, false) != NULL)
-			return true;
-		return false;
-	}
+	/* Bare process nodes (/proc/self, /proc/thread-self) carry the
+	 * process label itself as the security.selinux xattr - that is the
+	 * path getcon()/id use - and PRoot's real proc stand-in would leak
+	 * the untrusted app context through it. */
+	if (strcmp(pidp, "self") == 0 || strcmp(pidp, "thread-self") == 0)
+		return true;
+	if (afakesu_is_pid_match(tracee, pidp))
+		return true;
+	return false;
 }
 
 /*
@@ -578,12 +851,25 @@ static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
 	tail = strstr(path, "/attr/");
 	if (tail == NULL) {
 		/* The "attr" directory itself carries the process label. */
-		if (strcmp(path + strlen(path) - strlen("/attr"), "/attr") != 0)
-			return false;
+		if (strcmp(path + strlen(path) - strlen("/attr"), "/attr") == 0)
+			goto own;
+		/* Bare process nodes: security.selinux xattr on /proc/self,
+		 * /proc/thread-self or /proc/<own-pid>, which getcon()/id read. */
+		{
+			char name[64];
+			word_t name_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);
+			if (name_addr == 0
+			 || read_string(tracee, name, name_addr, sizeof(name) - 1) < 0)
+				return false;
+			if (strcmp(name, "security.selinux") != 0
+			 && strcmp(name, "security.current") != 0)
+				return false;
+		}
 	} else if (!afakesu_attr_name_is_selinux(tail + strlen("/attr/"))) {
 		return false;
 	}
 
+own:
 	ctx = afakesu_read_session_ctx();
 	if (ctx == NULL)
 		return false;
@@ -3172,6 +3458,8 @@ case PR_execve:
 		status = get_sysarg_path(tracee, path, SYSARG_2);
 		if (status < 0)
 			break;
+
+		afakesu_regen_pending_status(tracee, path);
 
 		if (tracee->execfn_addr != 0 && strcmp(path, "/proc/self/auxv") == 0) {
 			tracee->sysexit_pending = true;

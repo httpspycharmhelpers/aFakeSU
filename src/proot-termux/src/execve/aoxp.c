@@ -296,6 +296,23 @@ int resize_array_of_xpointers(ArrayOfXPointers *array, size_t index, ssize_t del
 }
 
 /**
+ * Remove @array[@index] in place, shifting the following entries left.
+ * Unlike resize_array_of_xpointers(_, index, -1) this also works for
+ * index 0 (it never memmoves before the buffer).  It returns -EINVAL
+ * when @index is out of range, 0 otherwise.
+ */
+int remove_xpointee(ArrayOfXPointers *array, size_t index)
+{
+	if (index >= array->length)
+		return -EINVAL;
+
+	memmove(&array->_xpointers[index], &array->_xpointers[index + 1],
+		(array->length - index - 1) * sizeof(XPointer));
+	array->length--;
+	return 0;
+}
+
+/**
  * Copy into *@array_ the pointer array pointed to by @reg from
  * @tracee's memory space.  Only the first @nb_entries are copied,
  * unless it is 0 then all the entries up to the NULL pointer are

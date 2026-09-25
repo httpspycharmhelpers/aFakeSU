@@ -229,6 +229,8 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
 	/* Canonicalize recursely 'user_path' into 'guest_path'.  */
 	cursor = user_path;
 	finality = NOT_FINAL;
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP canon-in[%s] recursion=%u\n", user_path, recursion_level);
 	while (!IS_FINAL(finality)) {
 		Comparison comparison;
 		char component[NAME_MAX];
@@ -264,6 +266,25 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
 		status = substitute_binding_stat(tracee, finality, recursion_level, scratch_path, host_path);
 		if (status < 0)
 			return status;
+
+		/* AFAKESU fusion: /proc virtual files such as "<PID>/status"
+		 * and "<PID>/attr/current" are regular files, not symlinks,
+		 * so the symlink-dereference branch below never consults
+		 * readlink_proc() for them and the fake-file redirects in
+		 * proc.c stay dead.  Give proc.c a chance for every
+		 * non-link component living under /proc. */
+		if (status <= 0) {
+			Comparison proc_comparison = compare_paths("/proc", guest_path);
+			if (proc_comparison == PATHS_ARE_EQUAL || proc_comparison == PATH1_IS_PREFIX) {
+				Action proc_action = readlink_proc(tracee, scratch_path,
+								  guest_path, component, proc_comparison);
+				if (getenv("THJ_PDBG"))
+					fprintf(stderr, "THJP canon[%s] base=%s cmp=%d act=%d stat=%d\n",
+						component, guest_path, proc_comparison, proc_action, status);
+				if (proc_action == CANONICALIZE)
+					goto canon;
+			}
+		}
 
 		/* Nothing special to do if it's not a link or if we
 		 * explicitly ask to not dereference 'user_path', as

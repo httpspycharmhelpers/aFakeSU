@@ -692,6 +692,11 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 			if (status < 0)
 				break;
 
+			if (getenv("THJ_PDBG"))
+				fprintf(stderr, "THJP sec2 pr=%d fl=%lx sysexit=%d\n",
+					(int)get_sysnum(tracee, CURRENT), flags,
+					(sysexit_necessary ? 1 : 0));
+
 			/* Use the common ptrace flow when
 			 * sysexit has to be handled.  */
 			if ((flags & FILTER_SYSEXIT) != 0 || sysexit_necessary) {

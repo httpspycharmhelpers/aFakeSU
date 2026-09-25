@@ -34,12 +34,6 @@ cp "$BASH_BIN" "$BLD/bash.bin"
     --rename-section .data=.rodata,alloc,load,readonly,data,contents \
     bash.bin bash.bin.o) || exit 1
 
-echo "== terhijack.bin (embedded hook engine, v1.2) =="
-$CC -O2 -std=c99 -o "$BLD/terhijack.bin" "$ROOT/terhijack.c" || exit 1
-(cd "$BLD" && objcopy -I binary -O elf64-littleaarch64 -B aarch64 \
-    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
-    terhijack.bin terhijack.bin.o) || exit 1
-
 echo "== embedded libs (libiconv / libncursesw) =="
 for lib in libiconv.so libncursesw.so.6.5; do
     cp "/data/data/com.termux/files/usr/lib/$lib" "$BLD/$lib"
@@ -62,7 +56,7 @@ while IFS= read -r f; do
 done < <(find "$PT/src" -name "*.o" | sort)
 
 $CC -o "$ROOT/fakesu.elf" \
-    "$BLD/cli.o" $OBJS "$BLD/talloc.o" "$BLD/shmem.o" "$BLD/su.o" "$BLD/bash.bin.o" "$BLD/terhijack.bin.o" \
+    "$BLD/cli.o" $OBJS "$BLD/talloc.o" "$BLD/shmem.o" "$BLD/su.o" "$BLD/bash.bin.o" \
     "$BLD/libiconv.so.o" "$BLD/libncursesw.so.6.5.o" \
     -Wl,-z,noexecstack -llog || exit 1
 

@@ -587,6 +587,87 @@ static inline const char *get_loader_path(const Tracee *tracee)
 #endif
 }
 
+static void afakesu_envp_remove(ArrayOfXPointers *array, size_t index)
+{
+	/* resize_array_of_xpointers() cannot drop index 0 (its in-place
+	 * memmove would write before the buffer); remove_xpointee() can. */
+	remove_xpointee(array, index);
+}
+
+/**
+ * AFAKESU: scrub orchestration/host leaks out of the environment handed
+ * to the guest.  The su wrapper is launched from Termux, so the inherited
+ * environment carries Termux/PRoot bookkeeping (PREFIX, TERMUX_APP__*,
+ * PROOT_TMP_DIR, Termux JAVA_HOME/texmf/fonts dirs, a Termux
+ * LD_LIBRARY_PATH, PWD deep in /data/data/com.termux/...) that no real
+ * root shell on a stock device would ever expose.  Rewrite envp[] in
+ * place, before the kernel performs the execve.  Any variable whose name
+ * is bookkeeping, or whose value points into the Termux tree, is removed.
+ */
+static void afakesu_scrub_envp(Tracee *tracee)
+{
+	ArrayOfXPointers *envp;
+	size_t i;
+
+	if (fetch_array_of_xpointers(tracee, &envp, SYSARG_3, 0) < 0)
+		return;
+
+	envp->compare_xpointee = (compare_xpointee_t) compare_xpointee_env;
+
+	static const char *const drop_names[] = {
+		"PROOT_",     /* PROOT_TMP_DIR, PROOT_LOADER, ...      */
+		"TERMUX",     /* TERMUX_APP__*, TERMUX__*, TERMUX_HOME */
+		"PREFIX",     /* Termux $PREFIX                        */
+		"JAVA_HOME", "TEXMFLOCAL", "TEXMFVAR", "TRFONTS",
+		"LD_PRELOAD", "LD_LIBRARY_PATH",
+		"COLORTERM", "TERMINFO", "TERMINFO_DIRS",
+		"SHELL_CMD",  /* rish/Termux shell hand-off artifacts */
+		"__THJ", "__t_", /* leftover TerHijack bookkeeping        */
+		"OPENCODE", "AGENT", /* the harness this su was launched from */
+	};
+
+	for (i = 0; i < envp->length; ) {
+		char *entry = NULL;
+		const char *value;
+		int drop = 0;
+		size_t j;
+
+		if (read_xpointee_as_string(envp, i, &entry) < 0 || entry == NULL) {
+			i++;
+			continue;
+		}
+		for (j = 0; j < sizeof(drop_names) / sizeof(drop_names[0]); j++) {
+			if (strncmp(entry, drop_names[j], strlen(drop_names[j])) == 0) {
+				drop = 1;
+				break;
+			}
+		}
+		value = strchr(entry, '=');
+		if (!drop && value != NULL
+		    && (value - entry) == 4 && strncmp(entry, "PATH", 4) == 0) {
+			/* Keep PATH even in --preserve-environment mode, but
+			 * never let the Termux tree show up in it. */
+			if (strstr(value + 1, "com.termux") != NULL) {
+				if (write_xpointee_as_string(envp, i,
+					"/data/local/tmp/.su/bin:/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin") >= 0)
+					;
+			}
+			i++;
+			continue;
+		}
+		if (!drop && value != NULL && strstr(value + 1, "com.termux") != NULL)
+			drop = 1;
+
+		if (drop) {
+			afakesu_envp_remove(envp, i);
+			continue;
+		}
+		i++;
+	}
+
+	push_array_of_xpointers(envp, SYSARG_3);
+}
+
 /**
  * Extract all the information that will be required by
  * translate_load_*().  This function returns -errno if an error
@@ -665,6 +746,7 @@ int translate_execve_enter(Tracee *tracee)
 		if (status < 0)
 			return status;
 
+		afakesu_scrub_envp(tracee);
 		return 0;
 	}
 
@@ -717,5 +799,6 @@ int translate_execve_enter(Tracee *tracee)
 	/* Mask to its ptracer syscalls performed by the loader.  */
 	tracee->as_ptracee.ignore_loader_syscalls = true;
 
+	afakesu_scrub_envp(tracee);
 	return 0;
 }

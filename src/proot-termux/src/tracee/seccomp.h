@@ -1,6 +1,8 @@
 #include "tracee/tracee.h"
 #include "sys/vfs.h"
 
+extern const char *g_selinux_ctx;
+
 struct compat_statfs {
 	int f_type;
 	int f_bsize;

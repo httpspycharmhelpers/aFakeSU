@@ -33,9 +33,62 @@
 #include <linux/audit.h> /* AUDIT_ARCH_*,  */
 #include <string.h>      /* memcpy(3), */
 #include <stdlib.h>      /* strtol(3), */
+#include <limits.h>      /* PATH_MAX, */
 #include <linux/auxvec.h>/* AT_,  */
 #include <sys/socket.h>  /* cmsghdr, */
 #include <linux/net.h>   /* SYS_SENDMSG, */
+
+extern char g_work_dir[PATH_MAX];
+
+/* AFAKESU: per-uid supplementary group lists harvested from real device
+ * processes (workdir/.ugroups, "uid:g1 g2 ..."), so each fake <user>
+ * carries the group memberships that uid really has on this device
+ * (which may differ from the canonical "uidN" assumption). */
+static const gid_t *afk_ugroups_for(long uid, size_t *count)
+{
+	static gid_t list[128];
+	static size_t n = 0;
+	static long key = -2;   /* -2: not loaded yet */
+	static int tried = 0;
+
+	if (tried && key == uid) {
+		*count = n;
+		return list;
+	}
+	tried = 1;
+	key = uid;
+	n = 0;
+
+	char p[PATH_MAX];
+	snprintf(p, sizeof(p), "%s/.ugroups", g_work_dir);
+	FILE *f = fopen(p, "r");
+	if (f == NULL) {
+		*count = 0;
+		return list;
+	}
+	char line[1024];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		long u = -1;
+		char *colon = strchr(line, ':');
+		if (colon == NULL)
+			continue;
+		if (sscanf(line, "%ld", &u) != 1 || u != uid)
+			continue;
+		char *tok = strtok(colon + 1, " \t\r\n");
+		while (tok != NULL && n < sizeof(list) / sizeof(list[0])) {
+			long v;
+			char *end;
+			v = strtol(tok, &end, 10);
+			if (end != NULL && *end == '\0' && v >= 0 && v <= 0xffffffffL)
+				list[n++] = (gid_t) v;
+			tok = strtok(NULL, " \t\r\n");
+		}
+		break;
+	}
+	fclose(f);
+	*count = n;
+	return list;
+}
 
 #include "extension/extension.h"
 #include "syscall/syscall.h"
@@ -333,8 +386,8 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_geteuid32,		FILTER_SYSEXIT },
 	{ PR_getgid,		FILTER_SYSEXIT },
 	{ PR_getgid32,		FILTER_SYSEXIT },
-	{ PR_getgroups,		FILTER_SYSEXIT },
-	{ PR_getgroups32,	FILTER_SYSEXIT },
+	{ PR_getgroups,		FILTER_SYSENTER },
+	{ PR_getgroups32,	FILTER_SYSENTER },
 	{ PR_getresgid,		FILTER_SYSEXIT },
 	{ PR_getresgid32,	FILTER_SYSEXIT },
 	{ PR_getresuid,		FILTER_SYSEXIT },
@@ -820,14 +873,45 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 	case PR_setgroups32:
 	case PR_getgroups:
 	case PR_getgroups32:
-		/* TODO */
-#ifdef USERLAND
-	/* TODO: need to actually emulate these */
-	//On Android, the system is returning gids that our rootfs knows nothing about
-	//which is generating errors
-	set_sysnum(tracee, PR_void);
-	return 0;
-#endif
+		if (sysnum == PR_getgroups || sysnum == PR_getgroups32) {
+			word_t list = peek_reg(tracee, ORIGINAL, SYSARG_2);
+			word_t size = peek_reg(tracee, ORIGINAL, SYSARG_1);
+			size_t cnt;
+			const gid_t *gl = afk_ugroups_for((long) config->ruid, &cnt);
+			if (cnt == 0) {
+				/* No device-harvested list for this uid: report the
+				 * session's primary (fake) gid, the old behavior. */
+				word_t gid = (word_t)(int) config->sgid;
+				if (getenv("THJ_PDBG"))
+					fprintf(stderr, "THJP fid0 gg fallback gid=%lu\n",
+						(unsigned long) gid);
+				if (list != 0 && (size_t) size >= 1)
+					write_data(tracee, list, &gid, sizeof(gid));
+				set_sysnum(tracee, PR_void);
+				poke_reg(tracee, SYSARG_RESULT, 1);
+				return 0;
+			}
+			if (getenv("THJ_PDBG"))
+				fprintf(stderr, "THJP fid0 gg uid=%ld cnt=%zu size=%lu\n",
+					(long) config->ruid, cnt, (unsigned long) size);
+			if ((size_t) size < cnt && list != 0) {
+				set_sysnum(tracee, PR_void);
+				poke_reg(tracee, SYSARG_RESULT, (word_t)(int) -EINVAL);
+				return 0;
+			}
+			if (list != 0) {
+				for (size_t k = 0; k < cnt; k++)
+					write_data(tracee, list + (word_t) k * sizeof(gid_t),
+						   &gl[k], sizeof(gid_t));
+			}
+			set_sysnum(tracee, PR_void);
+			poke_reg(tracee, SYSARG_RESULT, (word_t) cnt);
+			return 0;
+		} else {
+			set_sysnum(tracee, PR_void);
+			poke_reg(tracee, SYSARG_RESULT, 0);
+		}
+		return 0;
 
 	default:
 		return 0;

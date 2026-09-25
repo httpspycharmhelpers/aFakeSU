@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -23,8 +24,6 @@
 extern const unsigned char _binary_bash_bin_start[];
 extern const unsigned char _binary_bash_bin_end[];
 #define EMBEDDED_BASH_SIZE ((size_t)(_binary_bash_bin_end - _binary_bash_bin_start))
-extern const char _binary_terhijack_bin_start[];
-extern const char _binary_terhijack_bin_end[];
 extern const unsigned char _binary_libiconv_so_start[];
 extern const unsigned char _binary_libiconv_so_end[];
 extern const unsigned char _binary_libncursesw_so_6_5_start[];
@@ -33,6 +32,11 @@ extern const unsigned char _binary_libncursesw_so_6_5_end[];
 #define VERSION_CODE "27000"
 #define DEFAULT_SHELL "/system/bin/sh"
 #define ANDROID_PATH "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin"
+/* Guest-visible mirror of <workdir>/bin (the getprop/mount/chcon wrappers).
+ * It must NOT expose the Termux path in $PATH or `which`, so the host
+ * workdir/bin is bound here and this clean path is what the session sees. */
+#define GUEST_BIN_DIR "/data/local/tmp/.su/bin"
+#define GUEST_PATH GUEST_BIN_DIR ":/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin"
 #define INT_MAX_VALUE 2147483647
 #define WORK_DIR_NAME ".tmp"
 #define REAL_FILE "real_uids.txt"
@@ -43,6 +47,10 @@ char g_work_dir[PATH_MAX];
 char g_proot_argv0[64];
 int g_proot_argv0_fix = 0;
 static const char *g_fake_name = "sh";
+/* Export of the fake comm name for the proot side (proc.c/enter.c) so
+ * /proc/<pid>/status "Name:" matches /system/bin/sh, not the real
+ * Termux interpreter. */
+char g_fake_comm[64] = "sh";
 static char *g_cmd = NULL;
 static size_t g_cmd_cap = 0, g_cmd_len = 0;
 static const char *g_grp = NULL;
@@ -60,23 +68,8 @@ static long g_uid = -1;
 static long g_gid = -1;
 const char *g_selinux_ctx = NULL;
 
-/* /system/bin/id would report the *real* process context (getselfattr is
- * outside PRoot's interception), so the session's `id` is our own sh
- * wrapper that answers like a genuine root shell. */
-static void emit_id_wrapper(FILE *f, const char *ctx)
-{
-	fprintf(f, "#!/system/bin/sh\n"
-		"case \"$*\" in\n"
-		"  *-Z*) echo '%s' ;;\n"
-		"  *-un) echo root ;;\n"
-		"  *-u*) echo 0 ;;\n"
-		"  *-g*) echo 0 ;;\n"
-		"  *-G) echo 0 ;;\n"
-		"  *) echo \"uid=0(root) gid=0(root) groups=0(root) context=%s\" ;;\n"
-		"esac\n",
-		ctx, ctx);
-}
-
+static bool valid_uint_str(const char *s, long *out);
+static const char *aid_name_for_uid(long uid, char *name, size_t namesz);
 /*
  * Persisted property overrides.  Real root flips read-only props with
  * resetprop/setprop (ro.debuggable, ro.build.*, ro.product.*, ...); a
@@ -85,7 +78,7 @@ static void emit_id_wrapper(FILE *f, const char *ctx)
  */
 static void emit_prop_wrappers(const char *ctx_path)
 {
-	const char *wd = g_work_dir ? g_work_dir : "/data/local/tmp/termux";
+	const char *wd = g_work_dir[0] != '\0' ? g_work_dir : "/data/local/tmp/termux";
 	char st[PATH_MAX];
 	char p[PATH_MAX];
 	snprintf(st, sizeof(st), "%s/.props", wd);
@@ -98,14 +91,6 @@ static void emit_prop_wrappers(const char *ctx_path)
 			"P=\"%s\"\n"
 			"[ -f \"$P\" ] || exec /system/bin/getprop \"$@\"\n"
 			"if [ \"$#\" -eq 0 ] || [ \"$1\" = \"-p\" ]; then\n"
-			"  X=\n"
-			"  while IFS='=' read -r k v; do X=\"${X}${k}|\"; done < \"$P\"\n"
-			"  X=$(echo \"$X\" | sed 's/|$//')\n"
-			"  if [ -n \"$X\" ]; then\n"
-			"    /system/bin/getprop \"$@\" | grep -vE \"^\\[($X)\\]\"\n"
-			"  else\n"
-			"    /system/bin/getprop \"$@\"\n"
-			"  fi\n"
 			"  while IFS='=' read -r k v; do echo \"[$k]: [$v]\"; done < \"$P\"\n"
 			"  exit 0\n"
 			"fi\n"
@@ -127,17 +112,30 @@ static void emit_prop_wrappers(const char *ctx_path)
 			fprintf(f,
 				"#!/system/bin/sh\n"
 				"P=\"%s\"\n"
-				"name=\"\"; val=\"\"; args=0\n"
+				"W=\"%s\"\n"
+				"name=\"\"; val=\"\"; args=0; del=0\n"
 				"for a in \"$@\"; do\n"
-				"  case \"$a\" in -*) : ;; *)\n"
-				"    args=$((args+1))\n"
-				"    [ $args -eq 1 ] && name=\"$a\"\n"
-				"    [ $args -eq 2 ] && val=\"$a\"\n"
+				"  case \"$a\" in\n"
+				"    -d|--delete) del=1 ;;\n"
+				"    -p|--persistent) : ;;\n"
+				"    -*) : ;;\n"
+				"    *) args=$((args+1))\n"
+				"       [ $args -eq 1 ] && name=\"$a\"\n"
+				"       [ $args -eq 2 ] && val=\"$a\" ;;\n"
 				"  esac\n"
 				"done\n"
+				"M=\"$W/.propsmod\"\n"
+				"if [ $del -eq 1 ] && [ -n \"$name\" ]; then\n"
+				"  [ -f \"$P\" ] && sed -i \"/^$name=/d\" \"$P\"\n"
+				"  [ -f \"$M\" ] && sed -i \"/^$name$/d\" \"$M\"\n"
+				"  exit 0\n"
+				"fi\n"
 				"if [ $args -ge 2 ] && [ -n \"$name\" ]; then\n"
 				"  [ -f \"$P\" ] && sed -i \"/^$name=/d\" \"$P\"\n"
 				"  echo \"$name=$val\" >> \"$P\"\n"
+				"  mkdir -p \"$W\"\n"
+				"  [ -f \"$M\" ] && sed -i \"/^$name$/d\" \"$M\"\n"
+				"  echo \"$name\" >> \"$M\"\n"
 				"  exit 0\n"
 				"fi\n"
 				"if [ $args -eq 1 ] && [ -n \"$name\" ] && [ -f \"$P\" ]; then\n"
@@ -146,7 +144,7 @@ static void emit_prop_wrappers(const char *ctx_path)
 				"  done < \"$P\"\n"
 				"fi\n"
 				"exec /system/bin/%s \"$@\"\n",
-				st, names[i]);
+				st, wd, names[i]);
 			fclose(f);
 			chmod(p, 0755);
 		}
@@ -186,7 +184,7 @@ static void emit_mount_wrapper(const char *ctx_path)
 		"  exit 0\n"
 		"fi\n"
 		"exec /system/bin/mount \"$@\"\n",
-		g_work_dir ? g_work_dir : "/data/local/tmp/termux");
+		g_work_dir[0] != '\0' ? g_work_dir : "/data/local/tmp/termux");
 	fclose(f);
 	chmod(p, 0755);
 }
@@ -395,7 +393,7 @@ static const char *const AID_USERS =
 	"sdk_sandbox:1090\n"
 	"security_log_writer:1091\n"
 	"prng_seeder:1092\n"
-	"uprobestuds:1093\n"
+	"uprobestsats:1093\n"
 	"cros_ec:1094\n"
 	"mmd:1095\n"
 	"shell:2000\n"
@@ -421,19 +419,340 @@ static const char *const AID_GAPS =
 	"oem_3008:3008\n"
 	"oem_3020:3020";
 static const struct { const char *user; const char *ctx; } AID_SELINUX_CTX[] = {
+	/* uid 1000-2000: AOSP seapp_contexts + daemon domains */
+	{ "root", "u:r:kernel:s0" },
 	{ "system", "u:r:system_app:s0" },
 	{ "radio", "u:r:radio:s0" },
 	{ "bluetooth", "u:r:mtk_hal_bluetooth:s0" },
 	{ "wifi", "u:r:wificond:s0" },
 	{ "media", "u:r:mediametrics:s0" },
 	{ "keystore", "u:r:keystore:s0" },
-	{ "drm", "u:r:drmserver:s0" },
+	{ "drm", "u:r:drm:s0" },
 	{ "gps", "u:r:mnld:s0" },
+	{ "shell", "u:r:shell:s0" },
+	{ "log", "u:r:logd:s0" },
+	{ "logd", "u:r:logd:s0" },
+	{ "graphics", "u:r:surfaceflinger:s0" },
+	{ "camera", "u:r:cameraserver:s0" },
+	{ "input", "u:r:input:s0" },
+	{ "audio", "u:r:audioserver:s0" },
+	{ "vpn", "u:r:vpn:s0" },
+	{ "install", "u:r:installd:s0" },
+	{ "mount", "u:r:vold:s0" },
+	{ "vold", "u:r:vold:s0" },
+	{ "adb", "u:r:adbd:s0" },
+	{ "dhcp", "u:r:dhcp:s0" },
+	{ "nfc", "u:r:nfc:s0" },
+	{ "mtp", "u:r:mtp:s0" },
+	{ "clat", "u:r:clatd:s0" },
+	{ "mediadrm", "u:r:mediadrm:s0" },
+	{ "shared_relro", "u:r:shared_relro:s0" },
+	{ "net_admin", "u:r:network_stack:s0" },
+	{ "network_stack", "u:r:network_stack:s0" },
+	{ "net_bt_admin", "u:r:bluetooth:s0" },
+	{ "net_bt", "u:r:bluetooth:s0" },
+	{ "net_bt_stack", "u:r:bluetooth:s0" },
+	{ "audioserver", "u:r:audioserver:s0" },
+	{ "cameraserver", "u:r:cameraserver:s0" },
+	{ "debuggerd", "u:r:debuggerd:s0" },
+	{ "nobody", "u:r:nobody:s0" },
 };
+/* Real daemon/app domains that init/zygote/device genuinely reachable ones,
+ * allowed as the only valid domain namespace for an injected -Z/--context. */
+static const char *const SELINUX_KNOWN_EXTRA_CTX[] = {
+	"u:r:system_server:s0", "u:r:init:s0", "u:r:system_init:s0",
+	"u:r:zygote:s0", "u:r:surfaceflinger:s0", "u:r:servicemanager:s0",
+	"u:r:netd:s0", "u:r:vold:s0", "u:r:installd:s0", "u:r:adbd:s0",
+	"u:r:untrusted_app:s0", "u:r:platform_app:s0", "u:r:priv_app:s0",
+	"u:r:isolated_app:s0", "u:r:su:s0",
+};
+static void selinux_ctx_reject(const char *in)
+{
+	fprintf(stderr,
+		"su: security context `%s' names a domain that does not exist on this device; refusing\n",
+		in);
+	exit(1);
+}
+static int selinux_ctx_known(const char *ctx)
+{
+	size_t i;
+	if (ctx == NULL)
+		return 0;
+	char base[128];
+	const char *mls = strstr(ctx, ":s0:c");
+	if (mls != NULL) {
+		size_t n = (size_t)(mls - ctx) + 3;
+		if (n >= sizeof(base))
+			return 0;
+		memcpy(base, ctx, n);
+		base[n] = '\0';
+		ctx = base;
+	}
+	for (i = 0; i < sizeof(AID_SELINUX_CTX)/sizeof(AID_SELINUX_CTX[0]); i++)
+		if (strcmp(AID_SELINUX_CTX[i].ctx, ctx) == 0)
+			return 1;
+	for (i = 0; i < sizeof(SELINUX_KNOWN_EXTRA_CTX)/sizeof(SELINUX_KNOWN_EXTRA_CTX[0]); i++)
+		if (strcmp(SELINUX_KNOWN_EXTRA_CTX[i], ctx) == 0)
+			return 1;
+	return 0;
+}
+/* Accept a full u:r:<domain>:s0 string or a bare known name (e.g. "shell",
+ * "radio"), normalize it, and hard-fail if the domain is not one this device
+ * could actually carry.  Rejects any non-sepolicy character (no "/", spaces,
+ * newlines) so the ctx file can never be corrupted via injection. */
+static const char *selinux_ctx_norm_validate(const char *in)
+{
+	static char norm[128];
+	const char *ctx = in;
+	size_t i;
+	if (in == NULL || in[0] == '\0') {
+		fprintf(stderr, "su: empty security context\n");
+		exit(1);
+	}
+	if (strncmp(in, "u:r:", 4) != 0) {
+		for (i = 0; i < sizeof(AID_SELINUX_CTX)/sizeof(AID_SELINUX_CTX[0]); i++)
+			if (strcmp(AID_SELINUX_CTX[i].user, in) == 0) {
+				ctx = AID_SELINUX_CTX[i].ctx;
+				break;
+			}
+		if (strncmp(ctx, "u:r:", 4) != 0) {
+			/* a bare domain name: only usable if it maps to a known ctx */
+			static char bare[128];
+			if (snprintf(bare, sizeof(bare), "u:r:%s:s0", in) >= (int)sizeof(bare))
+				selinux_ctx_reject(in);
+			if (!selinux_ctx_known(bare))
+				selinux_ctx_reject(in);
+			ctx = bare;
+		}
+	}
+	for (i = 0; ctx[i] != '\0'; i++) {
+		char c = ctx[i];
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		      || (c >= '0' && c <= '9') || c == '_' || c == ':' || c == ','))
+			selinux_ctx_reject(in);
+		if (i >= sizeof(norm) - 2)
+			selinux_ctx_reject(in);
+	}
+	if (!selinux_ctx_known(ctx))
+		selinux_ctx_reject(in);
+	snprintf(norm, sizeof(norm), "%s", ctx);
+	return norm;
+}
 static bool valid_uint_str(const char *s, long *out);
+static int rishq_query(const char *cmd, char **out, size_t *outlen);
+static const char *aid_merged_table(void);
+static const char *const g_usermap_name = ".usermap";
+/* Look up "name:uid" lines in a merged table; return true when row found. */
+static bool aid_table_has_uid(const char *table, long uid)
+{
+	if (table == NULL)
+		return false;
+	char *copy = strdup(table);
+	if (copy == NULL)
+		return false;
+	bool res = false;
+	char *save = NULL;
+	for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		char *colon = strchr(line, ':');
+		long v;
+		if (colon && valid_uint_str(colon + 1, &v) && v == uid) {
+			res = true;
+			break;
+		}
+	}
+	free(copy);
+	return res;
+}
+/* Append the oem_# auto-named ranges AOSP reserves (2900-2999 vendor,
+ * 5000-5999 second oem range): every value in these ranges exists as a
+ * resolvable user/group name on real devices. */
+static void aid_append_oem_range(char *merged, size_t cap, size_t *n, int lo, int hi)
+{
+	for (int u = lo; u <= hi; u++) {
+		size_t left = cap - *n;
+		if (left < 24)
+			break;
+		int w = snprintf(merged + *n, left, "oem_%d:%d\n", u, u);
+		if (w < 0)
+			break;
+		*n += (size_t)w;
+	}
+}
+/* Full, searchable identity table = static AID_USERS + the OEM/gap names
+ * + the auto-named oem ranges + the real user list fetched from the device
+ * itself via rishq (kept in workdir/.usermap).  This is what "su <user>"
+ * resolves names against, so every user the vendor actually exposes
+ * (incl. the 3000-series) has a uid<->name mapping instead of silently
+ * collapsing into root. */
+static const char *aid_merged_table(void)
+{
+	static char merged[65536];
+	static bool built = false;
+	if (!built) {
+		built = true;
+		size_t n = 0;
+		const char *tables[2] = { AID_USERS, AID_GAPS };
+		for (int ti = 0; ti < 2 && n < sizeof(merged) - 2; ti++) {
+			char *copy = strdup(tables[ti]);
+			if (copy == NULL)
+				continue;
+			char *save = NULL;
+			for (char *line = strtok_r(copy, "\n", &save); line && n < sizeof(merged) - 2;
+			     line = strtok_r(NULL, "\n", &save)) {
+				size_t l = strlen(line);
+				if (n + l + 2 >= sizeof(merged))
+					break;
+				memcpy(merged + n, line, l);
+				n += l;
+				merged[n++] = '\n';
+			}
+			free(copy);
+		}
+		aid_append_oem_range(merged, sizeof(merged), &n, 2900, 2999);
+		aid_append_oem_range(merged, sizeof(merged), &n, 5000, 5999);
+		/* Merge the device's real users (uid unknown to the static
+		 * table): e.g. vendor-only AIDs running on this box. */
+		char path[PATH_MAX];
+		snprintf(path, sizeof(path), "%s/%s", g_work_dir, g_usermap_name);
+		FILE *f = fopen(path, "r");
+		if (f) {
+			char line[256];
+			while (f && n < sizeof(merged) - 2 && fgets(line, sizeof(line), f)) {
+				char *sp = strchr(line, ' ');
+				if (!sp)
+					continue;
+				*sp = '\0';
+				char *end;
+				long u = strtol(sp + 1, &end, 10);
+				if (end == sp + 1 || u < 1000 || u >= 200000)
+					continue;
+				size_t nl = strlen(line);
+				while (nl > 0 && (line[nl - 1] == '\n' || line[nl - 1] == '\r'))
+					line[--nl] = '\0';
+				if (nl == 0 || strchr(line, ':') || strchr(line, ' '))
+					continue;
+				if (aid_table_has_uid(merged, u))
+					continue;
+				if (n + nl + 16 >= sizeof(merged))
+					continue;
+				memcpy(merged + n, line, nl);
+				n += nl;
+				merged[n++] = ':';
+				size_t digs = snprintf(merged + n, sizeof(merged) - n, "%ld\n", u);
+				n += digs;
+			}
+			fclose(f);
+		}
+		merged[n] = '\0';
+	}
+	return merged;
+}
+/* Fetch the device's real uid<->name list through rishq (the shell-level
+ * bridge), persist it to workdir/.usermap, and refresh it once an hour so
+ * vendor-specific users discovered by later runs keep the tables warm
+ * without hammering shizuku on every invocation. */
+static void aid_real_patch(void)
+{
+	if (g_work_dir[0] == '\0')
+		return;
+	char path[PATH_MAX], tmp[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/%s", g_work_dir, g_usermap_name);
+	snprintf(tmp, sizeof(tmp), "%s/%s.tmp", g_work_dir, g_usermap_name);
+	struct stat st;
+	if (stat(path, &st) == 0 && st.st_size > 0
+	    && time(NULL) - st.st_mtime < 3600)
+		return;
+	char *out = NULL;
+	size_t outlen = 0;
+	if (rishq_query("ps -A -o USER= -o UID= 2>/dev/null", &out, &outlen) != 0) {
+		free(out);
+		return;
+	}
+	FILE *f = fopen(tmp, "w");
+	if (!f) {
+		free(out);
+		return;
+	}
+	int written = 0;
+	if (out != NULL) {
+		char *save = NULL;
+		for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			char *sp = strchr(line, ' ');
+			if (!sp)
+				continue;
+			*sp = '\0';
+			char *end;
+			errno = 0;
+			long u = strtol(sp + 1, &end, 10);
+			if (end == sp + 1 || errno)
+				continue;
+			char *ep = end;
+			while (*ep == ' ')
+				ep++;
+			if (*ep != '\0' && *ep != '\n' && *ep != '\r')
+				continue;
+			if (line[0] == '\0')
+				continue;
+			fprintf(f, "%s %ld\n", line, u);
+			written++;
+		}
+	}
+	if (written == 0)
+		fprintf(f, "root 0\n");
+	fclose(f);
+	rename(tmp, path);
+	free(out);
+
+	/* Harvest real per-uid supplementary groups from live processes
+	 * (/proc/<pid>/status "Groups:"), so each su <user> keeps the group
+	 * memberships that uid actually carries on this device (which can
+	 * differ from the canonical single-gid assumption). */
+	char gpath[PATH_MAX], gtmp[PATH_MAX];
+	snprintf(gpath, sizeof(gpath), "%s/.ugroups", g_work_dir);
+	snprintf(gtmp, sizeof(gtmp), "%s/.ugroups.tmp", g_work_dir);
+	out = NULL;
+	outlen = 0;
+	if (rishq_query(
+	    "for d in /proc/[0-9]*; do s=\"$d/status\"; [ -r \"$s\" ] || continue; "
+	    "u=$(sed -n 's/^Uid:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' \"$s\"); "
+	    "[ -n \"$u\" ] || continue; "
+	    "g=$(sed -n 's/^Groups:[[:space:]]*//p' \"$s\"); "
+	    "[ -n \"$g\" ] || g=0; "
+	    "echo \"$u:$g\"; done 2>/dev/null | sort -u", &out, &outlen) != 0) {
+		free(out);
+		return;
+	}
+	f = fopen(gtmp, "w");
+	if (f == NULL) {
+		free(out);
+		return;
+	}
+	if (out != NULL) {
+		char *save = NULL;
+		for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			char *colon = strchr(line, ':');
+			if (colon == NULL)
+				continue;
+			char *end;
+			long u = strtol(line, &end, 10);
+			if (end != colon || u < 0 || u > 0x7fffffffL)
+				continue;
+			char *g = colon + 1;
+			while (*g == ' ' || *g == '\t')
+				g++;
+			/* Keep the first occurrence per uid. */
+			if (strncmp(line, "999999999:", 10) == 0)
+				continue;
+			fprintf(f, "%ld:%s\n", u, g);
+		}
+	}
+	fclose(f);
+	rename(gtmp, gpath);
+	free(out);
+}
 static const char *aid_name_for_uid(long uid, char *name, size_t namesz)
 {
-	char *table = strdup(AID_USERS);
+	char *table = strdup(aid_merged_table());
 	if (table == NULL)
 		return NULL;
 	char *save = NULL;
@@ -991,33 +1310,6 @@ static void ensure_bash(void)
 	rename(tmp, path);
 	chmod(path, 0755);
 }
-static void ensure_terhijack(void)
-{
-	char path[PATH_MAX];
-	snprintf(path, sizeof(path), "%s/terhijack", g_work_dir);
-	struct stat st;
-	if (stat(path, &st) == 0)
-		return;
-	char tmp[PATH_MAX];
-	snprintf(tmp, sizeof(tmp), "%s/terhijack.tmp", g_work_dir);
-	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-	if (fd < 0)
-		return;
-	const unsigned char *p = (const unsigned char *)_binary_terhijack_bin_start;
-	size_t left = (size_t)(_binary_terhijack_bin_end - _binary_terhijack_bin_start);
-	while (left > 0) {
-		ssize_t n = write(fd, p, left);
-		if (n < 0) {
-			if (errno == EINTR) continue;
-			break;
-		}
-		p += n;
-		left -= (size_t)n;
-	}
-	close(fd);
-	rename(tmp, path);
-	chmod(path, 0755);
-}
 static void copy_file(const char *src, const char *dst)
 {
 	int in = open(src, O_RDONLY);
@@ -1265,13 +1557,21 @@ static void gen_fake_status(void)
 		} else if (strncmp(line, "CapInh:", 7) == 0)
 			repl = "CapInh:\t0000000000000000\n";
 		else if (strncmp(line, "CapPrm:", 7) == 0)
-			repl = "CapPrm:\t000001ffffffffff\n";
+			repl = g_uid == 0
+				? "CapPrm:\t000001ffffffffff\n"
+				: "CapPrm:\t0000000000000000\n";
 		else if (strncmp(line, "CapEff:", 7) == 0)
-			repl = "CapEff:\t000001ffffffffff\n";
+			repl = g_uid == 0
+				? "CapEff:\t000001ffffffffff\n"
+				: "CapEff:\t0000000000000000\n";
 		else if (strncmp(line, "CapBnd:", 7) == 0)
-			repl = "CapBnd:\t000001ffffffffff\n";
+			repl = g_uid == 0
+				? "CapBnd:\t000001ffffffffff\n"
+				: "CapBnd:\t0000000000000000\n";
 		else if (strncmp(line, "CapAmb:", 7) == 0)
-			repl = "CapAmb:\t000001ffffffffff\n";
+			repl = g_uid == 0
+				? "CapAmb:\t0000000000000000\n"
+				: "CapAmb:\t0000000000000000\n";
 		const char *use = repl ? repl : line;
 		size_t l = strlen(use);
 		if (n + l < cap) {
@@ -1282,6 +1582,7 @@ static void gen_fake_status(void)
 	fclose(f);
 	char path[PATH_MAX];
 	snprintf(path, sizeof(path), "%s/status", g_work_dir);
+	unlink(path);
 	FILE *sf = fopen(path, "w");
 	if (sf) {
 		fwrite(buf, 1, n, sf);
@@ -1290,32 +1591,255 @@ static void gen_fake_status(void)
 	free(buf);
 }
 
+/* Fake /proc/<pid>/cmdline for the session: a real su runs
+ * "/system/bin/sh -c <command>", so the procfs entry must show exactly
+ * that (NUL separated, trailing NUL) instead of the Termux bash path. */
+static void gen_fake_cmdline(void)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/cmdline", g_work_dir);
+	unlink(path);
+	FILE *f = fopen(path, "w");
+	if (f == NULL)
+		return;
+	static const char sh[] = "/system/bin/sh";
+	fwrite(sh, 1, sizeof(sh) - 1, f);
+	fputc('\0', f);
+	if (g_cmd != NULL && g_cmd[0] != '\0') {
+		fwrite("-c", 1, 2, f);
+		fputc('\0', f);
+		fwrite(g_cmd, 1, strlen(g_cmd), f);
+		fputc('\0', f);
+	}
+	fclose(f);
+}
+
+static void rm_rf(const char *path)
+{
+	char buf[PATH_MAX];
+	struct stat st;
+	if (lstat(path, &st) != 0)
+		return;
+	if (S_ISDIR(st.st_mode)) {
+		DIR *d = opendir(path);
+		if (!d)
+			return;
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+				continue;
+			snprintf(buf, sizeof(buf), "%s/%s", path, e->d_name);
+			rm_rf(buf);
+		}
+		closedir(d);
+		rmdir(path);
+	} else {
+		unlink(path);
+	}
+}
+
+/*
+ * Harvest the device's real property set and freeze it into
+ * <workdir>/.props.  The session's getprop/setprop/resetprop wrappers
+ * then operate on this file, so ro.* can be "changed" (resetprop) and
+ * every getprop answer stays self-consistent -- including the values
+ * that /system/build.prop mirrors.  An empty .props would make the
+ * wrappers pure pass-through relays of the device, which is correct but
+ * offers no place for a fake model/serial/... to stick.
+ */
+static void gen_fake_props(void)
+{
+	char path[PATH_MAX];
+	char modpath[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/.props", g_work_dir);
+	snprintf(modpath, sizeof(modpath), "%s/.propsmod", g_work_dir);
+
+	/* Values the user set through the session's setprop/resetprop live
+	 * in the previous .props and their keys are listed in .propsmod.
+	 * gen_fake_props() rebuilds .props from a fresh device harvest on
+	 * every session, so without this snapshot those edits would be
+	 * wiped; copy them back over the harvested ones. */
+	char frozen[4096][1024];
+	size_t nfrozen = 0;
+	{
+		FILE *mf = fopen(modpath, "r");
+		if (mf) {
+			FILE *pf = fopen(path, "r");
+			if (pf) {
+				char line[1024];
+				while (nfrozen < sizeof(frozen)/sizeof(frozen[0])
+				       && fgets(line, sizeof(line), pf) != NULL) {
+					char *eq = strchr(line, '=');
+					if (eq == NULL)
+						continue;
+					char key[1024], val[1024];
+					size_t klen = (size_t)(eq - line);
+					if (klen >= sizeof(key))
+						klen = sizeof(key) - 1;
+					memcpy(key, line, klen);
+					key[klen] = '\0';
+					strncpy(val, eq + 1, sizeof(val) - 1);
+					val[sizeof(val) - 1] = '\0';
+					val[strcspn(val, "\n")] = '\0';
+					rewind(mf);
+					char mline[1024];
+					while (fgets(mline, sizeof(mline), mf) != NULL) {
+						mline[strcspn(mline, "\n")] = '\0';
+						if (strcmp(mline, key) == 0) {
+							snprintf(frozen[nfrozen],
+								 sizeof(frozen[0]),
+								 "%s=%s", key, val);
+							frozen[nfrozen][sizeof(frozen[0]) - 1] = '\0';
+							nfrozen++;
+							break;
+						}
+					}
+				}
+				fclose(pf);
+			}
+			fclose(mf);
+		}
+	}
+
+	unlink(path);
+
+	char *out = NULL;
+	size_t outlen = 0;
+	if (run_cmd_capture("/system/bin/getprop", NULL, &out, &outlen) != 0) {
+		free(out);
+		return;
+	}
+
+	FILE *f = fopen(path, "w");
+	if (f == NULL) {
+		free(out);
+		return;
+	}
+	size_t pos = 0;
+	while (pos < outlen) {
+		char *nl = memchr(out + pos, '\n', outlen - pos);
+		size_t len = nl ? (size_t)(nl - (out + pos)) : outlen - pos;
+		if (len > 0) {
+			char line[1024];
+			if (len >= sizeof(line))
+				len = sizeof(line) - 1;
+			memcpy(line, out + pos, len);
+			line[len] = '\0';
+			if (line[0] == '[') {
+				size_t k;
+				for (k = 1; k < len; k++)
+					if (line[k] == ']' && k + 4 <= len
+					    && strncmp(line + k, "]: [", 4) == 0)
+						break;
+				if (k < len) {
+					line[k] = '\0';
+					char *v = line + k + 4;
+					size_t vlen = strlen(v);
+					if (vlen > 0 && v[vlen - 1] == ']')
+						v[vlen - 1] = '\0';
+					char key[1024];
+					snprintf(key, sizeof(key), "%s", line + 1);
+					/* skip if this key was user-edited; its
+					 * frozen value is appended after the
+					 * harvest below */
+					bool edited = false;
+					for (size_t i = 0; i < nfrozen; i++) {
+						if (strncmp(frozen[i], key,
+							    strlen(key)) == 0
+						    && frozen[i][strlen(key)] == '=') {
+							edited = true;
+							break;
+						}
+					}
+					if (!edited)
+						fprintf(f, "%s=%s\n", key, v);
+				}
+			}
+		}
+		pos += len + 1;
+	}
+	for (size_t i = 0; i < nfrozen; i++)
+		fprintf(f, "%s\n", frozen[i]);
+	fclose(f);
+	free(out);
+}
+
+/*
+ * Mirror /system/build.prop: the real one on this device is 0600
+ * root-owned and unreadable to the app domain, yet a root-like session
+ * must be able to read it.  Produce a plausible file from the SAME
+ * harvested property set so its values match getprop exactly, and bind
+ * it over /system/build.prop.
+ */
+static void gen_build_prop(void)
+{
+	char src[PATH_MAX], dst[PATH_MAX];
+	snprintf(src, sizeof(src), "%s/.props", g_work_dir);
+	snprintf(dst, sizeof(dst), "%s/build.prop", g_work_dir);
+
+	FILE *in = fopen(src, "r");
+	FILE *f = fopen(dst, "w");
+	if (in == NULL || f == NULL) {
+		if (in) fclose(in);
+		if (f) fclose(f);
+		return;
+	}
+	fprintf(f, "# begin build properties\n");
+	fprintf(f, "# autogenerated by aFakeSU\n");
+	char line[1024];
+	while (fgets(line, sizeof(line), in) != NULL) {
+		if (strncmp(line, "ro.", 3) == 0
+		    || strncmp(line, "build.", 6) == 0
+		    || strncmp(line, "persist.", 8) == 0) {
+			fputs(line, f);
+		}
+	}
+	fprintf(f, "# end build properties\n");
+	fclose(in);
+	fclose(f);
+	chmod(dst, 0644);
+}
+
+static void cleanup_workdir(void)
+{
+	/* A real su leaves nothing behind: drop every runtime artifact the
+	 * session produced, keeping only the harvest caches (.usermap,
+	 * .ugroups, .xattrs) that a following session may reuse.  The
+	 * dot-prefixed cache files stay invisible to a plain `ls` anyway. */
+	if (g_work_dir[0] == '\0')
+		return;
+	static const char *keep[] = { ".usermap", ".ugroups", ".xattrs",
+				      ".props", ".propsmod", NULL };
+	DIR *d = opendir(g_work_dir);
+	if (!d)
+		return;
+	struct dirent *e;
+	char buf[PATH_MAX];
+	while ((e = readdir(d)) != NULL) {
+		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+			continue;
+		bool held = false;
+		for (int i = 0; keep[i]; i++)
+			if (strcmp(e->d_name, keep[i]) == 0)
+				held = true;
+		if (held)
+			continue;
+		snprintf(buf, sizeof(buf), "%s/%s", g_work_dir, e->d_name);
+		rm_rf(buf);
+	}
+	closedir(d);
+}
+
 static void build_and_run_proot(void)
 {
 	bool enoexec_case = false;
 	const char *shell = g_shell;
 	const char *shell_argv0 = g_shell;
-	if (strcmp(g_shell, DEFAULT_SHELL) == 0) {
-		/*
-		 * $SHELL was unusable (or absent): fall back to our embedded
-		 * bash as the auxiliary session shell.  It carries the stock
-		 * argv0 "/system/bin/sh" so ps/comm keep looking like the
-		 * device's default mksh (TerHijack hooks need bash syntax the
-		 * real mksh would reject with "syntax error: unexpected ('").
-		 */
-		struct stat st;
-		char embedded[PATH_MAX];
-		snprintf(embedded, sizeof(embedded), "%s/bash", g_work_dir);
-		if (stat(embedded, &st) == 0) {
-			shell = strdup(embedded);
-			shell_argv0 = "/system/bin/sh";
-		}
-	}
-	if (shell != g_shell) {
-		strncpy(g_proot_argv0, shell_argv0, sizeof(g_proot_argv0) - 1);
-		g_proot_argv0[sizeof(g_proot_argv0) - 1] = '\0';
-		g_proot_argv0_fix = 1;
-	}
+	/* Default session shell is the device's real /system/bin/sh, so the
+	 * process that actually runs matches the faked /proc/<pid>/exe and
+	 * comm ("sh").  The embedded bash is only an auxiliary interpreter
+	 * for the rishq uid-table probe (see ensure_bash), never the session
+	 * shell. */
 	int rc = shell_validate(shell);
 	if (rc == 1)
 		exit(0);
@@ -1325,6 +1849,11 @@ static void build_and_run_proot(void)
 	}
 	char *binds[8];
 	int bind_cnt = 0;
+	/* Freeze the device property set for the wrappers and mirror a
+	 * readable /system/build.prop off it, BEFORE the binds below
+	 * reference the generated build.prop. */
+	gen_fake_props();
+	gen_build_prop();
 	{
 		char ld[PATH_MAX];
 		snprintf(ld, sizeof(ld), "%s/linkerconfig/ld.config.txt", g_work_dir);
@@ -1343,17 +1872,35 @@ static void build_and_run_proot(void)
 			sprintf(b, "-b %s/etc_passwd:/etc/passwd -b %s/etc_group:/etc/group", g_work_dir, g_work_dir);
 			binds[bind_cnt++] = b;
 		}
+		/* The harvested /system/build.prop overlay: the original is
+		 * unreadable to the app domain, and its values must mirror
+		 * what getprop returns. */
+		char bp[PATH_MAX];
+		snprintf(bp, sizeof(bp), "%s/build.prop", g_work_dir);
+		if (stat(bp, &st) == 0 && st.st_size > 0) {
+			char *b = malloc(strlen(g_work_dir) + 64);
+			sprintf(b, "-b %s/build.prop:/system/build.prop", g_work_dir);
+			binds[bind_cnt++] = b;
+		}
 	}
 	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+		/* Mirror the wrapper dir at a non-Termux guest path so $PATH
+		 * and `which` never reveal /data/data/com.termux/... . */
+		char *gb = malloc(strlen(g_work_dir) + 64);
+		if (gb != NULL) {
+			sprintf(gb, "-b %s/bin:%s", g_work_dir, GUEST_BIN_DIR);
+			binds[bind_cnt++] = gb;
+		}
 		/* The ctx file is consumed via the AFAKESU /proc redirect
-		 * (readlink_proc "attr/*" self-binding), NOT a proot bind:
+		 * (readlink_proc attr-path self-binding), NOT a proot bind:
 		 * a bind would let stat() show the plain file (size 14,
 		 * mode 1777) instead of a procfs-shaped entry. */
 		char ctx_path[PATH_MAX];
 		snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+		unlink(ctx_path);
 		FILE *cf = fopen(ctx_path, "w");
 		if (cf) {
-			fprintf(cf, "%s\n", g_selinux_ctx);
+			fprintf(cf, "%s", g_selinux_ctx);
 			fclose(cf);
 		}
 	}
@@ -1362,11 +1909,12 @@ static void build_and_run_proot(void)
 		 * readlink_proc (component "status"), not by a proot bind: binds
 		 * can't match /proc paths because self/thread-self canonicalize
 		 * to /proc/<pid>, which is unknown at bind time. */
-		struct stat sst;
 		char st[PATH_MAX];
 		snprintf(st, sizeof(st), "%s/status", g_work_dir);
-		if (stat(st, &sst) != 0 || sst.st_size <= 0)
-			gen_fake_status();
+		/* Always regenerate: the status file is per-session and must
+		 * reflect the current persona (uid/gid/groups/ctx/caps). */
+		gen_fake_status();
+		gen_fake_cmdline();
 
 		/* Symlink used by enter.c to answer readlink("/proc/1/exe"). */
 		char exe1[PATH_MAX];
@@ -1449,25 +1997,18 @@ static void build_and_run_proot(void)
 	if (!enoexec_case && g_login)
 		login_flag = "-l";
 	if (!g_preserve) {
-		char tmppath[PATH_MAX];
-		snprintf(tmppath, sizeof(tmppath), "%s/bin", g_work_dir);
-		const char *cur = getenv("PATH");
+		/* Clean, stock-looking PATH: the wrapper dir (mirrored at
+		 * GUEST_BIN_DIR) shadows getprop/mount/chcon; the Termux
+		 * prefix is deliberately kept out of the session PATH. */
 		char path_env[PATH_MAX];
-		snprintf(path_env, sizeof(path_env), "%s:/sbin:/system/bin:/system/xbin:/system/sbin:%s",
-			 tmppath, cur ? cur : ANDROID_PATH);
+		snprintf(path_env, sizeof(path_env), "%s", GUEST_PATH);
 		setenv_str("PATH", path_env);
+		setenv_str("TMPDIR", "/data/local/tmp");
+		setenv_str("TMP", "/data/local/tmp");
 		if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
 			char ctx_path[PATH_MAX];
 			snprintf(ctx_path, sizeof(ctx_path), "%s/bin", g_work_dir);
 			mkdir(ctx_path, 0755);
-			char id_wrapper[PATH_MAX];
-			snprintf(id_wrapper, sizeof(id_wrapper), "%s/id", ctx_path);
-			FILE *f = fopen(id_wrapper, "w");
-			if (f) {
-				emit_id_wrapper(f, g_selinux_ctx);
-				fclose(f);
-				chmod(id_wrapper, 0755);
-			}
 			/* dmesg: the kernel log is gated by CAP_SYSLOG; a fake kernel
 			 * domain answers it like real root would, with plausible output. */
 			char dm_path[PATH_MAX];
@@ -1502,8 +2043,7 @@ static void build_and_run_proot(void)
 				chmod(ge_path, 0755);
 			}
 			char path_env[PATH_MAX];
-			const char *cur = getenv("PATH");
-			snprintf(path_env, sizeof(path_env), "%s:%s", ctx_path, cur ? cur : ANDROID_PATH);
+			snprintf(path_env, sizeof(path_env), "%s", GUEST_PATH);
 			setenv_str("PATH", path_env);
 			emit_prop_wrappers(ctx_path);
 			emit_mount_wrapper(ctx_path);
@@ -1515,8 +2055,15 @@ static void build_and_run_proot(void)
 		else
 			snprintf(home, sizeof(home), "/data/user/%ld", g_uid / 100000);
 		setenv_str("HOME", home);
-		char u0[32];
-		snprintf(u0, sizeof(u0), "u0_a%ld", g_uid);
+		char u0[96];
+		char unamebuf[96];
+		if (aid_name_for_uid(g_uid, unamebuf, sizeof(unamebuf)) != NULL
+		    && strchr(unamebuf, ' ') == NULL && strcmp(unamebuf, "1000") != 0)
+			snprintf(u0, sizeof(u0), "%s", unamebuf);
+		else if (g_uid >= 10000 && g_uid % 100000 >= 10000)
+			snprintf(u0, sizeof(u0), "u%ld_a%ld", g_uid / 100000, g_uid % 100000 - 10000);
+		else
+			snprintf(u0, sizeof(u0), "u0_a%ld", g_uid);
 		setenv_str("LOGNAME", u0);
 		setenv_str("USER", u0);
 		setenv_str("SHELL", shell == g_shell ? g_shell : shell_argv0);
@@ -1575,31 +2122,7 @@ static void build_and_run_proot(void)
 	}
 	if (g_cmd != NULL) {
 		argv[argc++] = "-c";
-char *wrapped = malloc(strlen(g_cmd) + 1024);
-		if (wrapped) {
-			char thpath[PATH_MAX];
-			snprintf(thpath, sizeof(thpath), "%s/terhijack", g_work_dir);
-			snprintf(wrapped, strlen(g_cmd) + 1024,
-				"export __THJ_BIN=%s && "
-				"eval \"$(%s --init 2>/dev/null)\" && "
-				"eval \"$(%s -c 'id -Z' -o '%s' 2>/dev/null)\" && "
-				"eval \"$(%s -c 'cat /proc/self/attr/current' -o '%s' 2>/dev/null)\" && "
-				"eval \"$(%s -c 'ls -Z /' -r 'ls /' 2>/dev/null)\" && "
-				"eval \"$(%s -c 'ps -Z' -r 'ps' 2>/dev/null)\" && "
-				"eval \"$(%s -c 'getenforce' -o 'Enforcing' 2>/dev/null)\" && "
-				"%s",
-				thpath, thpath,
-				g_selinux_ctx ? g_selinux_ctx : "u:r:shell:s0",
-				thpath, g_selinux_ctx ? g_selinux_ctx : "u:r:shell:s0",
-				thpath,
-				thpath,
-				thpath,
-				thpath,
-				g_cmd);
-			argv[argc++] = wrapped;
-		} else {
-			argv[argc++] = g_cmd;
-		}
+		argv[argc++] = g_cmd;
 	} else if (g_pos_cnt > 1) {
 		for (size_t i = 1; i < g_pos_cnt; i++)
 			argv[argc++] = g_pos[i];
@@ -1617,27 +2140,41 @@ static void parse_user_and_groups(const char *user)
 	} else if (isdigit((unsigned char)user[0])) {
 		const char *tmp = user;
 		const char *comma = strchr(tmp, ',');
+		const char *colon = strchr(tmp, ':');
+		const char *sep = NULL;
+		if (comma && colon)
+			sep = comma < colon ? comma : colon;
+		else
+			sep = comma ? comma : colon;
 		char uid_str[32], gid_str[32];
-		if (comma) {
-			size_t n = (size_t)(comma - tmp);
+		if (sep) {
+			size_t n = (size_t)(sep - tmp);
 			if (n >= sizeof(uid_str))
 				n = sizeof(uid_str) - 1;
 			memcpy(uid_str, tmp, n);
 			uid_str[n] = '\0';
-			const char *rest = comma + 1;
-			const char *comma2 = strchr(rest, ',');
-			if (comma2) {
-				n = (size_t)(comma2 - rest);
-				if (n >= sizeof(gid_str))
-					n = sizeof(gid_str) - 1;
-				memcpy(gid_str, rest, n);
-				gid_str[n] = '\0';
-			} else {
-				strncpy(gid_str, rest, sizeof(gid_str) - 1);
-				gid_str[sizeof(gid_str) - 1] = '\0';
-			}
-			if (gid_str[0] == '\0')
+			const char *rest = sep + 1;
+			if (rest[0] == '\0') {
 				strcpy(gid_str, uid_str);
+			} else {
+				const char *comma2 = strchr(rest, ',');
+				const char *colon2 = strchr(rest, ':');
+				const char *sep2 = NULL;
+				if (comma2 && colon2)
+					sep2 = comma2 < colon2 ? comma2 : colon2;
+				else
+					sep2 = comma2 ? comma2 : colon2;
+				if (sep2) {
+					n = (size_t)(sep2 - rest);
+					if (n >= sizeof(gid_str))
+						n = sizeof(gid_str) - 1;
+					memcpy(gid_str, rest, n);
+					gid_str[n] = '\0';
+				} else {
+					strncpy(gid_str, rest, sizeof(gid_str) - 1);
+					gid_str[sizeof(gid_str) - 1] = '\0';
+				}
+			}
 		} else {
 			strncpy(uid_str, tmp, sizeof(uid_str) - 1);
 			uid_str[sizeof(uid_str) - 1] = '\0';
@@ -1653,7 +2190,7 @@ static void parse_user_and_groups(const char *user)
 		}
 	} else {
 		bool matched = false;
-		char *table = strdup(AID_USERS);
+		char *table = strdup(aid_merged_table());
 		char *save = NULL;
 		size_t ulen = strlen(user);
 		for (char *line = strtok_r(table, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -1723,7 +2260,7 @@ static void parse_options(int argc, char **argv)
 				else if (strcmp(name, "supp-group") == 0)
 					g_suppg[g_suppg_cnt++] = val;
 				else if (strcmp(name, "context") == 0)
-					g_selinux_ctx = val;
+					g_selinux_ctx = selinux_ctx_norm_validate(val);
 				else if (strcmp(name, "target") == 0)
 					g_tgt = val;
 				else if (strcmp(name, "shell") == 0)
@@ -1760,7 +2297,7 @@ static void parse_options(int argc, char **argv)
 				} else if (strcmp(name, "context") == 0) {
 					if (i >= argc)
 						usage_err("su: option `--context' requires an argument");
-					g_selinux_ctx = argv[i++];
+					g_selinux_ctx = selinux_ctx_norm_validate(argv[i++]);
 				} else if (strcmp(name, "target") == 0) {
 					if (i >= argc)
 						usage_err("su: option `--target' requires an argument");
@@ -1832,7 +2369,7 @@ static void parse_options(int argc, char **argv)
 						break;
 					case 'Z':
 					case 'z':
-						g_selinux_ctx = arg;
+						g_selinux_ctx = selinux_ctx_norm_validate(arg);
 						break;
 					case 't':
 						g_tgt = arg;
@@ -1877,6 +2414,7 @@ static void parse_options(int argc, char **argv)
 }
 int main(int argc, char **argv)
 {
+	atexit(cleanup_workdir);
 	if (argc > 0 && argv[0] != NULL) {
 		size_t alen = strlen(argv[0]);
 		if (alen > 1)
@@ -1911,11 +2449,13 @@ int main(int argc, char **argv)
 		strcpy(g_self_dir, ".");
 	}
 	snprintf(g_work_dir, sizeof(g_work_dir), "%s/%s", g_self_dir, WORK_DIR_NAME);
-	mkdir(g_work_dir, 0777);
-	chmod(g_work_dir, 0777);
+	mkdir(g_work_dir, 0700);
+	chmod(g_work_dir, 0700);
+	/* Wipe stale artifacts of a previous (possibly crashed) session before
+	 * staging this one; caches (.usermap/.ugroups/.xattrs) survive. */
+	cleanup_workdir();
 	ensure_bash();
 	ensure_libs();
-	ensure_terhijack();
 	setup_ld_library_path();
 	linker_config_setup();
 	aid_files_setup();
@@ -1925,6 +2465,7 @@ int main(int argc, char **argv)
 		perror("malloc");
 		return 1;
 	}
+	aid_real_patch();
 	parse_options(argc, argv);
 	long v;
 	if (g_grp != NULL && !valid_uint_str(g_grp, &v))
@@ -1950,61 +2491,72 @@ int main(int argc, char **argv)
 			invalid_gid(g_suppg[0]);
 		g_gid = v;
 	}
+	/* No explicit -g/-s given: attach the groups this uid really has on the
+	 * device (harvested to .ugroups) instead of assuming a single canonical
+	 * gid — the real membership may be anything, not just the uid's own. */
+	if (g_suppg_cnt == 0) {
+		char gp[PATH_MAX];
+		snprintf(gp, sizeof(gp), "%s/.ugroups", g_work_dir);
+		FILE *gf = fopen(gp, "r");
+		if (gf) {
+			char line[1024];
+			while (fgets(line, sizeof(line), gf) != NULL) {
+				char *colon = strchr(line, ':');
+				if (colon == NULL)
+					continue;
+				long u;
+				char *end;
+				u = strtol(line, &end, 10);
+				if (end != colon || u != g_uid)
+					continue;
+				char *save = NULL;
+				for (char *tok = strtok_r(colon + 1, " \t\r\n", &save);
+				     tok != NULL && g_suppg_cnt < (size_t) argc;
+				     tok = strtok_r(NULL, " \t\r\n", &save)) {
+					long gv;
+					if (!valid_uint_str(tok, &gv)
+					    || gv < 0 || gv > 0x7fffffffL)
+						continue;
+					/* Primary gid stays the resolved one (AID gid == uid);
+					 * the real device membership only fills the
+					 * supplementary list. */
+					if (gv == g_gid)
+						continue;
+					g_suppg[g_suppg_cnt++] = strdup(tok);
+				}
+				break;
+			}
+			fclose(gf);
+		}
+	}
 	ensure_current_uid_in_files();
 	if (g_selinux_ctx == NULL)
 		g_selinux_ctx = selinux_ctx_for_user(user);
+	{
+		char ug[PATH_MAX];
+		snprintf(ug, sizeof(ug), "%s/.uidgid", g_work_dir);
+		FILE *uf = fopen(ug, "w");
+		if (uf) {
+			fprintf(uf, "%ld:%ld\n", g_uid, g_gid);
+			fclose(uf);
+		}
+	}
 	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
 		char ctx_path[PATH_MAX];
 		snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+		unlink(ctx_path);
 		FILE *cf = fopen(ctx_path, "w");
-		if (cf) { fprintf(cf, "%s\n", g_selinux_ctx); fclose(cf); }
-		char idp[PATH_MAX];
-		snprintf(idp, sizeof(idp), "%s/bin", g_work_dir);
-		mkdir(idp, 0755);
-		char idf[PATH_MAX];
-		snprintf(idf, sizeof(idf), "%s/id", idp);
-		FILE *f = fopen(idf, "w");
-		if (f) {
-			emit_id_wrapper(f, g_selinux_ctx);
-			fclose(f); chmod(idf, 0755);
-		}
+		if (cf) { fprintf(cf, "%s", g_selinux_ctx); fclose(cf); }
 	}
 	{
-		/*
-		 * Session shell = the caller's current shell ($SHELL), so the
-		 * su session runs the user's real environment; the embedded bash
-		 * is only an auxiliary fallback (unset/unusable $SHELL).  The
-		 * stock /system/bin/sh (mksh) would reject the bash-only TerHijack
-		 * hook scripts, hence the embedded fallback keeps argv0 "/system/bin/sh".
-		 * The $SHELL binary must be executable by the *current* run user
-		 * (a termux-private 0700 bash is not, under rishq's uid 2000).
-		 */
-		const char *env_shell = getenv("SHELL");
-		if (strcmp(g_shell, DEFAULT_SHELL) == 0
-		    && env_shell != NULL && env_shell[0] != '\0'
-		    && strcmp(env_shell, DEFAULT_SHELL) != 0
-		    && strcmp(env_shell, "/bin/sh") != 0) {
-			/* A "sh"-named shell is the stock mksh (it rejects the
-			 * bash-only TerHijack hooks): treat it as the default and
-			 * let the embedded bash stay as the auxiliary session
-			 * shell.  Any other current shell that is executable by
-			 * the current run user wins. */
-			const char *bn = strrchr(env_shell, '/');
-			bn = bn ? bn + 1 : env_shell;
-			if (strcmp(bn, "sh") != 0 && access(env_shell, X_OK) == 0)
-				g_shell = env_shell;
-		}
-	}
-	{
-		const char *s = g_shell;
-		if (s == NULL || strcmp(s, DEFAULT_SHELL) == 0)
-			g_fake_name = "sh";
-		else {
-			const char *p = strrchr(s, '/');
-			g_fake_name = (p && p[1]) ? p + 1 : s;
-		}
+		/* The session presents as a stock su shell: it really runs
+		 * the device's /system/bin/sh and /proc/<pid>/exe answers the
+		 * same, so comm/Name must be "sh" (never the Termux bash). */
+		g_fake_name = "sh";
+		snprintf(g_fake_comm, sizeof(g_fake_comm), "sh");
 	}
 	gen_fake_status();
+	gen_fake_cmdline();
 	if (g_tgt != NULL)
 		fprintf(stderr, "su: taking mount namespace of PID %s\n", g_tgt);
 	if (g_mount)

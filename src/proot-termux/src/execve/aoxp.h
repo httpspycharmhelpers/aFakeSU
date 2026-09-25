@@ -67,6 +67,7 @@ static inline int sizeof_xpointee(ArrayOfXPointers *array, size_t index)
 
 extern int find_xpointee(ArrayOfXPointers *array, const void *reference);
 extern int resize_array_of_xpointers(ArrayOfXPointers *array, size_t index, ssize_t nb_delta_entries);
+extern int remove_xpointee(ArrayOfXPointers *array, size_t index);
 extern int fetch_array_of_xpointers(Tracee *tracee, ArrayOfXPointers **array, Reg reg, size_t nb_entries);
 extern int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg);
 

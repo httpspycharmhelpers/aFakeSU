@@ -363,6 +363,8 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_getpeername,	FILTER_SYSEXIT },
 	{ PR_getsockname,	FILTER_SYSEXIT },
 	{ PR_getxattr,		0 },
+	{ PR_getselfattr,	0 },
+	{ PR_setselattr,	0 },
 	{ PR_inotify_add_watch,	0 },
 #ifdef __ANDROID__
 	{ PR_ioctl,		FILTER_SYSEXIT },

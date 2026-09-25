@@ -42,6 +42,7 @@ typedef struct {
 #define FILTERED_SYSNUM_END { PR_void, 0 }
 
 #define FILTER_SYSEXIT  0x1
+#define FILTER_SYSENTER 0x2
 
 extern int enable_syscall_filtering(const Tracee *tracee);
 

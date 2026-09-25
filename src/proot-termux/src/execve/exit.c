@@ -42,6 +42,66 @@
 #include "path/temp.h"
 #include "cli/note.h"
 
+extern int g_proot_argv0_fix;
+extern char g_proot_argv0[];
+
+/* Rewrite the argv[0] string of the exec'd image when it points into the
+ * faked root's private workdir (".../.tmp/bash").  The kernel's exec leaves
+ * argv[0] at a stable address on the initial stack (captured as
+ * execfn_addr); poking that string declutters ps/the shell's $0. */
+static void sanitize_argv0(const Tracee *tracee, word_t addr, const char *nv)
+{
+	unsigned char orig[128];
+	size_t olen = 0;
+
+	if (addr == 0 || nv == NULL || nv[0] == '\0')
+		return;
+
+	while (olen < sizeof(orig)) {
+		errno = 0;
+		word_t w = peek_word(tracee, addr + olen);
+		if (errno != 0)
+			break;
+		memcpy(orig + olen, &w, sizeof(word_t));
+		olen += sizeof(word_t);
+		const unsigned char *p = (const unsigned char *)&w;
+		int nul = 0;
+		for (size_t j = 0; j < sizeof(word_t); j++) {
+			if (p[j] == '\0') { nul = 1; break; }
+		}
+		if (nul)
+			break;
+	}
+	if (olen <= 1)
+		return;
+
+	/* Only touch strings that live in the private workdir. */
+	int marker = 0;
+	for (size_t i = 0; i + 4 < olen; i++) {
+		if (orig[i] == '.' && orig[i+1] == 't' && orig[i+2] == 'm'
+		    && orig[i+3] == 'p' && orig[i+4] == '/') { marker = 1; break; }
+	}
+	if (!marker)
+		return;
+
+	size_t wlen = strlen(nv);
+	if (wlen + 1 > olen)
+		return;
+	memcpy(orig, nv, wlen + 1);
+
+	size_t writable = ((wlen + 1 + sizeof(word_t) - 1) / sizeof(word_t)) * sizeof(word_t);
+	if (writable > olen)
+		writable = olen;
+	for (word_t a = addr; a < addr + writable; a += sizeof(word_t)) {
+		word_t w = 0;
+		memcpy(&w, orig + (a - addr), sizeof(word_t));
+		errno = 0;
+		poke_word(tracee, a, w);
+		if (errno != 0)
+			break;
+	}
+}
+
 
 /**
  * Fill @path with the content of @vectors, formatted according to
@@ -212,6 +272,9 @@ static int transfer_load_script(Tracee *tracee)
 	 * since PR_GET_AUXV reads from kernel memory and bypasses the loader's
 	 * in-memory auxv patch. */
 	tracee->execfn_addr = peek_word(tracee, stack_pointer + sizeof_word(tracee));
+
+	if (g_proot_argv0_fix && g_proot_argv0[0] != '\0')
+		sanitize_argv0(tracee, tracee->execfn_addr, g_proot_argv0);
 
 	needs_executable_stack = (tracee->load_info->needs_executable_stack
 				|| (   tracee->load_info->interp != NULL

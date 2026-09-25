@@ -25,11 +25,29 @@
 #include <stdlib.h>  /* atoi(3), strtol(3), */
 #include <errno.h>   /* E*, */
 #include <assert.h>  /* assert(3), */
+#include <unistd.h>  /* access(2), */
+#include <stdbool.h> /* bool */
 
 #include "path/proc.h"
 #include "tracee/tracee.h"
 #include "path/path.h"
 #include "path/binding.h"
+
+/* AFAKESU fusion: the fake /proc files (ctx, status) live in the su
+ * wrapper's workdir; redirect tracee reads of /proc/self/{attr/current,
+ * status} and /proc/thread-self/... onto those plain files. */
+extern char g_work_dir[PATH_MAX];
+extern const char *g_selinux_ctx;
+
+static bool attr_is_selinux(const char *name)
+{
+	static const char *names[] = { "current", "prev", "exec", "fscreate",
+				       "keycreate", "sockcreate" };
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+		if (strcmp(name, names[i]) == 0)
+			return true;
+	return false;
+}
 
 /**
  * This function emulates the @result of readlink("@base/@component")
@@ -57,15 +75,19 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
 	/* Remember: comparison = compare_paths("/proc", base)  */
 	switch (comparison) {
 	case PATHS_ARE_EQUAL:
-		/* Substitute "/proc/self" with "/proc/<PID>".  */
-		if (strcmp(component, "self") != 0)
-			return DEFAULT;
-
-		status = snprintf(result, PATH_MAX, "/proc/%d", tracee->pid);
-		if (status < 0 || status >= PATH_MAX)
-			return -EPERM;
-
-		return CANONICALIZE;
+		/* Substitute "/proc/self" and "/proc/thread-self" with
+		 * "/proc/<PID>", so every proc pseudo-file (attr/current,
+		 * status, ...) is serviced by the session stand-ins instead
+		 * of the host proc.  "thread-self" is what libselinux
+		 * getcon()/id actually reads.  */
+		if (strcmp(component, "self") == 0
+		 || strcmp(component, "thread-self") == 0) {
+			status = snprintf(result, PATH_MAX, "/proc/%d", tracee->pid);
+			if (status < 0 || status >= PATH_MAX)
+				return -EPERM;
+			return CANONICALIZE;
+		}
+		return DEFAULT;
 
 	case PATH1_IS_PREFIX:
 		/* Handle "/proc/<PID>" below, where <PID> is process
@@ -109,8 +131,18 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
 	switch (comparison) {
 	case PATHS_ARE_EQUAL:
 		known_tracee = get_tracee(tracee, pid, false);
-		if (known_tracee == NULL)
+		if (known_tracee == NULL) {
+			/* Other processes' exe is unreadable to the faked
+			 * session (real EACCES); a root-like domain should
+			 * succeed.  Emulate the canonical init binary for
+			 * PID 1, the one every root-checker samples. */
+			if (pid == 1 && strcmp(component, "exe") == 0) {
+				static const char init_exe[] = "/system/bin/init";
+				strncpy(result, init_exe, sizeof(init_exe));
+				return CANONICALIZE;
+			}
 			return DEFAULT;
+		}
 
 #define SUBSTITUTE(name, string)				\
 		do {						\
@@ -127,14 +159,108 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
 
 		/* Substitute link "/proc/<PID>/???" with the content
 		 * of tracee->???.  */
-		SUBSTITUTE(exe, known_tracee->exe);
+		if (strcmp(component, "exe") == 0) {
+			/* The whole session is a fake root domain: every owned
+			 * process answers the stock shell as its executable, so
+			 * the real termux/com.termux binaries can never surface. */
+			const char *exe = "/system/bin/sh";
+			status = strlen(exe);
+			if (status >= PATH_MAX)
+				return -EPERM;
+			strncpy(result, exe, status + 1);
+			return CANONICALIZE;
+		}
 		SUBSTITUTE(cwd, known_tracee->fs->cwd);
 		SUBSTITUTE(root, get_root(known_tracee));
 #undef SUBSTITUTE
+		if (attr_is_selinux(component)
+		    && g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+			char ctx_path[PATH_MAX];
+			int s = snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+			if (s > 0 && (size_t) s < sizeof(ctx_path)
+			    && access(ctx_path, F_OK) == 0) {
+				strncpy(result, ctx_path, PATH_MAX);
+				return CANONICALIZE;
+			}
+		}
+		if (strcmp(component, "status") == 0) {
+			char st_path[PATH_MAX];
+			int s = snprintf(st_path, sizeof(st_path), "%s/status", g_work_dir);
+			if (s > 0 && (size_t) s < sizeof(st_path)
+			    && access(st_path, F_OK) == 0) {
+				strncpy(result, st_path, PATH_MAX);
+				return CANONICALIZE;
+			}
+		}
+		/* /proc/<pid>/cmdline must read as "/system/bin/sh -c ...",
+		 * not as the Termux bash path (see gen_fake_cmdline). */
+		if (strcmp(component, "cmdline") == 0) {
+			char cl_path[PATH_MAX];
+			int s = snprintf(cl_path, sizeof(cl_path), "%s/cmdline", g_work_dir);
+			if (s > 0 && (size_t) s < sizeof(cl_path)
+			    && access(cl_path, F_OK) == 0) {
+				strncpy(result, cl_path, PATH_MAX);
+				return CANONICALIZE;
+			}
+		}
+		/* /proc/<pid>/maps: scrubbed copy (prooted-*, Termux paths
+		 * replaced), regenerated on open (afakesu_regen_maps_for_pid). */
+		if (strcmp(component, "maps") == 0) {
+			char mp_path[PATH_MAX];
+			int s = snprintf(mp_path, sizeof(mp_path), "%s/maps", g_work_dir);
+			if (s > 0 && (size_t) s < sizeof(mp_path)
+			    && access(mp_path, F_OK) == 0) {
+				strncpy(result, mp_path, PATH_MAX);
+				return CANONICALIZE;
+			}
+		}
 		return DEFAULT;
 
 	case PATH1_IS_PREFIX:
-		/* Handle "/proc/<PID>/???" below.  */
+		/* Handle "/proc/<PID>/attr/current":  reached with
+		 * base="/proc/<PID>/attr", component="current".  Also
+		 * "/proc/<PID>/task/<TID>/status" (thread-self) and
+		 * any deeper "<PID>/.../status": regular files, so the
+		 * caller (canonicalize in canon.c) only consults this
+		 * after the AFAKESU hook re-directs every non-link
+		 * component under /proc.  */
+		known_tracee = get_tracee(tracee, pid, false);
+		if (known_tracee != NULL && g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0'
+		    && attr_is_selinux(component)) {
+			char *slash = strrchr(base, '/');
+			if (slash != NULL && strcmp(slash, "/attr") == 0) {
+				char ctx_path[PATH_MAX];
+				int s = snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
+				if (s > 0 && (size_t) s < sizeof(ctx_path)
+				    && access(ctx_path, F_OK) == 0) {
+					strncpy(result, ctx_path, PATH_MAX);
+					return CANONICALIZE;
+				}
+			}
+		}
+		if (known_tracee != NULL && strcmp(component, "status") == 0) {
+			char st_path[PATH_MAX];
+			int s = snprintf(st_path, sizeof(st_path), "%s/status", g_work_dir);
+			if (s > 0 && (size_t) s < sizeof(st_path)
+			    && access(st_path, F_OK) == 0) {
+				strncpy(result, st_path, PATH_MAX);
+				return CANONICALIZE;
+			}
+		}
+		/* init's exe symlink is not readable by an untrusted domain;
+		 * a member of the fake-root session answers it like init would
+		 * (reached with base="/proc/1", component="/exe"). */
+		if (pid == 1 && strcmp(component, "exe") == 0) {
+			if (getenv("THJ_PDBG"))
+				fprintf(stderr, "THJP p1exe base=%s comp=%s\n", base, component);
+			char exe1[PATH_MAX];
+			int s = snprintf(exe1, sizeof(exe1), "%s/.exe1", g_work_dir);
+			if (s > 0 && (size_t) s < sizeof(exe1)
+			    && access(exe1, F_OK) == 0) {
+				strncpy(result, exe1, PATH_MAX);
+				return CANONICALIZE;
+			}
+		}
 		break;
 
 	default:

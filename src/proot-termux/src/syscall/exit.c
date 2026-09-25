@@ -96,34 +96,67 @@ static bool afakesu_load_ctx(char out[256], size_t *out_n)
 	return true;
 }
 
+/* AFAKESU: the identity the su session switched to ("<uid>:<gid>", root
+ * 0:0 when no user was requested).  The stat rewriting below stamps files
+ * (overlay, /proc stand-ins) with that identity instead of always root. */
+static void afakesu_load_id(long *uid, long *gid)
+{
+	static long s_uid = -2, s_gid = -2; /* -2 == not loaded yet */
+
+	if (s_uid != -2) {
+		*uid = s_uid;
+		*gid = s_gid;
+		return;
+	}
+	s_uid = 0;
+	s_gid = 0;
+	char path[PATH_MAX];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/.uidgid", g_work_dir);
+	f = fopen(path, "r");
+	if (f != NULL) {
+		if (fscanf(f, "%ld:%ld", &s_uid, &s_gid) != 2) {
+			s_uid = 0;
+			s_gid = 0;
+		}
+		fclose(f);
+	}
+	*uid = s_uid;
+	*gid = s_gid;
+}
+
+static bool afakesu_is_pid_match(const Tracee *tracee, const char *pidstr)
+{
+	char pidbuf[32];
+	const char *slash = strchr(pidstr, '/');
+	size_t n = (slash == NULL) ? strlen(pidstr) : (size_t) (slash - pidstr);
+	pid_t p;
+
+	if (n == 0 || n >= sizeof(pidbuf))
+		return false;
+	memcpy(pidbuf, pidstr, n);
+	pidbuf[n] = '\0';
+	p = (pid_t) atoi(pidbuf);
+	if (p == tracee->pid)
+		return true;
+	return get_tracee(tracee, p, false) != NULL;
+}
+
 static bool afakesu_own_attr_path(const Tracee *tracee, const char *path)
 {
 	const char *pidstr;
-	const char *slash;
 
 	if (strncmp(path, "/proc/", 6) != 0)
 		return false;
 
 	pidstr = path + 6;
-	if (strncmp(pidstr, "self/", 5) == 0)
+	if (strncmp(pidstr, "self/", 5) == 0
+	 || strncmp(pidstr, "thread-self/", 12) == 0)
 		return true;
-
-	slash = strchr(pidstr, '/');
-	if (slash == NULL || (size_t) (slash - pidstr) >= 32)
-		return false;
-	{
-		char pidbuf[32];
-		pid_t p;
-		memcpy(pidbuf, pidstr, slash - pidstr);
-		pidbuf[slash - pidstr] = '\0';
-		p = (pid_t) atoi(pidbuf);
-		if (p == tracee->pid)
-			return true;
-		if (get_tracee(tracee, p, false) != NULL)
-			return true;
-		return false;
-	}
-	return true;
+	if (strcmp(pidstr, "self") == 0 || strcmp(pidstr, "thread-self") == 0)
+		return true;
+	return afakesu_is_pid_match(tracee, pidstr);
 }
 
 static void afakesu_poke_attr_value(Tracee *tracee, const char *value,
@@ -157,12 +190,25 @@ static void afakesu_patch_proc_getxattr(Tracee *tracee)
 	attr = strstr(path, "/attr/");
 	if (attr == NULL) {
 		/* The "attr" directory itself carries the process label. */
-		if (strcmp(path + strlen(path) - 5, "/attr") != 0)
-			return;
+		if (strcmp(path + strlen(path) - 5, "/attr") == 0)
+			goto own;
+		/* Bare process nodes read by getcon()/id: security.selinux on
+		 * /proc/self | /proc/thread-self | /proc/<own-pid>. */
+		{
+			char name[64];
+			word_t name_addr = peek_reg(tracee, MODIFIED, SYSARG_2);
+			if (name_addr == 0
+			 || read_string(tracee, name, name_addr, sizeof(name) - 1) < 0)
+				return;
+			if (strcmp(name, "security.selinux") != 0
+			 && strcmp(name, "security.current") != 0)
+				return;
+		}
 	} else if (!attr_name_is_selinux(attr + 6)) {
 		return;
 	}
 
+own:
 	if (!afakesu_load_ctx(ctx, &n))
 		return;
 
@@ -247,11 +293,13 @@ static void afakesu_patch_proc_stat(Tracee *tracee, word_t sysnum)
 	clock_gettime(CLOCK_REALTIME, &now);
 	if (sysnum == PR_statx) {
 		struct statx st;
+		long fuid, fgid;
 		if (read_data(tracee, &st, buf, sizeof(st)) < 0)
 			return;
+		afakesu_load_id(&fuid, &fgid);
 		st.stx_mode = (overlay || mode == 0) ? st.stx_mode : (st.stx_mode & S_IFMT) | mode;
-		st.stx_uid = 0;
-		st.stx_gid = 0;
+		st.stx_uid = fuid;
+		st.stx_gid = fgid;
 		if (!keep_size && mode != 0)
 			st.stx_size = 0;
 		st.stx_nlink = 1;
@@ -266,11 +314,13 @@ static void afakesu_patch_proc_stat(Tracee *tracee, word_t sysnum)
 		(void) write_data(tracee, buf, &st, sizeof(st));
 	} else {
 		struct stat st;
+		long fuid, fgid;
 		if (read_data(tracee, &st, buf, sizeof(st)) < 0)
 			return;
+		afakesu_load_id(&fuid, &fgid);
 		st.st_mode = (overlay || mode == 0) ? st.st_mode : (st.st_mode & S_IFMT) | mode;
-		st.st_uid = 0;
-		st.st_gid = 0;
+		st.st_uid = fuid;
+		st.st_gid = fgid;
 		if (!keep_size && mode != 0)
 			st.st_size = 0;
 		st.st_nlink = 1;
@@ -893,12 +943,6 @@ void translate_syscall_exit(Tracee *tracee)
 
 	case PR_wait4:
 	case PR_waitpid:
-		if ((word_t) peek_reg(tracee, ORIGINAL, SYSARG_NUM) == 416) {
-			/* security.getselfattr rides the same enum slot as
-			 * wait4 on this build; it has no path argument. */
-			afakesu_patch_getselfattr(tracee);
-			goto end;
-		}
 		if (tracee->as_ptracer.waits_in != WAITS_IN_PROOT)
 			goto end;
 
