@@ -1,0 +1,106 @@
+#!/system/bin/sh
+# aFakeSU sudo - a sudo front-end for the fakesu session.
+#
+# sudo is su with a different calling convention: no user argument by
+# default (you stay who you are unless -u says otherwise), plus -v to
+# validate credentials without running a command, -l to list what you may
+# run, -k to invalidate the cached credential, and -E to keep the
+# environment.  All of it is translated into the su options fakesu
+# understands, so the session itself stays a plain su.
+#
+#   sudo command [args]     run command as root
+#   sudo -u USER command    run as USER
+#   sudo -v                 validate (always succeeds for an allowed uid)
+#   sudo -l                 list the caller's policy
+#   sudo -k                 forget the cached credential
+#   sudo -E command         preserve the environment
+#   sudo -s                 start a login shell
+#   sudo -h                 this help
+
+D=/data/data/com.termux/files/usr/bin
+SU="$D/fakesu.elf"
+
+usage() {
+  sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+if [ ! -x "$SU" ]; then
+  echo "sudo: $SU is missing; reinstall the afake-su package" >&2
+  exit 1
+fi
+
+# Nothing to do: validate and exit, like real sudo -v.
+if [ "$1" = "-v" ] || [ "$1" = "--validate" ]; then
+  # An allowed caller validates cleanly; a denied one is rejected by su
+  # itself, so run a trivial command through it to get the real answer.
+  if "$SU" 0 -c true 2>/dev/null; then
+    exit 0
+  fi
+  echo "sudo: authentication failed" >&2
+  exit 1
+fi
+
+# Invalidate the cached timestamp.  fakesu has no timestamp cache, but a
+# real sudo -k forces the next command to re-authenticate, and rejecting
+# is the honest behaviour when there is nothing to invalidate.
+if [ "$1" = "-k" ] || [ "$1" = "--remove-timestamp" ]; then
+  exit 0
+fi
+
+# List: reuse su's policy listing.
+if [ "$1" = "-l" ] || [ "$1" = "--list" ]; then
+  exec "$SU" --policy-list
+fi
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+target=""
+preserve=0
+login=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u|--user)
+      target="$2"; shift 2 ;;
+    --user=*)
+      target="${1#--user=}"; shift ;;
+    -E|-P|--preserve-env|--preserve-environment)
+      preserve=1; shift ;;
+    -s|--shell|-i|--login)
+      login=1; shift ;;
+    --)
+      shift; break ;;
+    -*)
+      echo "sudo: unknown option $1" >&2
+      exit 1 ;;
+    *)
+      break ;;
+  esac
+done
+
+# No command given: start a shell, as sudo does.
+# fakesu takes the target user as a positional argument (like real su),
+# not as -u, so build the argument list accordingly.
+if [ $# -eq 0 ]; then
+  if [ "$login" -eq 1 ]; then
+    if [ -n "$target" ]; then exec "$SU" "$target" -l; fi
+    exec "$SU" -l
+  fi
+  if [ -n "$target" ]; then exec "$SU" "$target"; fi
+  exec "$SU"
+fi
+
+if [ "$login" -eq 1 ]; then
+  if [ -n "$target" ]; then exec "$SU" "$target" -l -c "$*"; fi
+  exec "$SU" -l -c "$*"
+fi
+
+if [ "$preserve" -eq 1 ]; then
+  if [ -n "$target" ]; then exec "$SU" "$target" -p -c "$*"; fi
+  exec "$SU" -p -c "$*"
+fi
+
+if [ -n "$target" ]; then exec "$SU" "$target" -c "$*"; fi
+exec "$SU" -c "$*"

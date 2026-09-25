@@ -62,6 +62,44 @@ static const char *g_shell = DEFAULT_SHELL;
 static bool g_login = false;
 static bool g_preserve = false;
 static bool g_mount = false;
+/* -i: force a pseudo-terminal even with -c.  -d: drop every Linux
+ * capability for the session, so a capability probe sees an unprivileged
+ * root rather than a fully capable one. */
+static bool g_interactive = false;
+static bool g_drop_cap = false;
+/* Set from -i and consumed by build_and_run_proot(). */
+static bool force_pty = false;
+
+/*
+ * Per-UID root policy, mirroring Magisk's su policy table.
+ * Magisk does not hand root to every caller.  Each requesting app UID gets
+ * its own policy, the caller is identified by the UID of the process asking
+ * for su, and the policy decides between four answers:
+ *
+ *   ALLOW     run the session as requested
+ *   DENY      refuse outright, exactly like Magisk's "deny" prompt choice
+ *   QUERY     no stored decision: ask.  Without a manager app to prompt,
+ *              Magisk denies, and so do we.
+ *   RESTRICT  allow, but force drop_cap, so the session is a root with an
+ *             empty capability set
+ *
+ * RESTRICT is why the capability handling is not just a -d flag: Magisk
+ * turns drop_cap on by itself when the policy says restrict.
+ */
+enum su_policy { SU_POLICY_ALLOW, SU_POLICY_DENY, SU_POLICY_QUERY, SU_POLICY_RESTRICT };
+
+/* Global root access modes, matching Magisk's RootAccess setting. */
+enum root_access { ROOT_ACCESS_PROMPT, ROOT_ACCESS_DISABLED,
+		   ROOT_ACCESS_ADB_ONLY, ROOT_ACCESS_APPS_ONLY };
+static enum root_access g_root_access = ROOT_ACCESS_PROMPT;
+
+/* Multiuser modes, matching Magisk's MultiuserMode. */
+enum multiuser_mode { MULTIUSER_OWNER_MANAGED, MULTIUSER_OWNER_ONLY,
+		      MULTIUSER_GLOBAL };
+static enum multiuser_mode g_multiuser = MULTIUSER_OWNER_MANAGED;
+
+/* The UID of whoever invoked su; the policy lookup keys off this. */
+static long g_caller_uid = -1;
 static const char **g_pos = NULL;
 static size_t g_pos_cnt = 0;
 static long g_uid = -1;
@@ -257,12 +295,14 @@ static void print_help(FILE *f)
 		"\n"
 		"Options:\n"
 		"  -c, --command COMMAND         Pass COMMAND to the invoked shell\n"
+		"  -i, --interactive             Force pseudo-terminal allocation when using -c\n"
 		"  -g, --group GROUP             Specify the primary group\n"
 		"  -G, --supp-group GROUP        Specify a supplementary group.\n"
 		"                                The first specified supplementary group is also used\n"
 		"                                as a primary group if the option -g is not specified.\n"
 		"  -Z, --context CONTEXT         Change SELinux context\n"
 		"  -t, --target PID              PID to take mount namespace from\n"
+		"  -d, --drop-cap                Drop all Linux capabilities\n"
 		"  -h, --help                    Display this help message and exit\n"
 		"  -, -l, --login                Pretend the shell to be a login shell\n"
 		"  -m, -p,\n"
@@ -272,6 +312,10 @@ static void print_help(FILE *f)
 		"  -V                            Display version code and exit\n"
 		"  -mm, -M,\n"
 		"  --mount-master                Force run in the global mount namespace\n"
+		"\n"
+		"  -t and -mm are accepted for command-line compatibility.  A fake root\n"
+		"  runs unprivileged, so it cannot really join another process's mount\n"
+		"  namespace; both options report that and continue in the current one.\n"
 		"\n");
 }
 static void usage_err(const char *fmt, ...)
@@ -1507,6 +1551,195 @@ static void setup_ld_library_path(void)
 		snprintf(ld, sizeof(ld), "%s", libdir);
 	setenv_str("LD_LIBRARY_PATH", ld);
 }
+/* Policy table, persisted next to the other harvest caches so a decision
+ * survives across sessions the way Magisk's SQLite policies table does. */
+#define POLICY_FILE ".policy"
+#define POLICY_MAX 256
+
+static const char *policy_file_path(void)
+{
+	static char p[PATH_MAX];
+	snprintf(p, sizeof(p), "%s/%s", g_work_dir, POLICY_FILE);
+	return p;
+}
+
+/* "uid policy" per line; policy is one of allow/deny/query/restrict. */
+/* "uid policy" per line; policy is one of allow/deny/query/restrict.
+ * Two global lines are also accepted: "root-access MODE" and
+ * "multiuser MODE", written by the --root-access/--multiuser switches. */
+static void policy_load_globals(void)
+{
+	FILE *f = fopen(policy_file_path(), "r");
+	if (f == NULL)
+		return;
+	char line[128];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char what[32], val[32];
+		if (sscanf(line, "root-access %31s", val) == 1) {
+			if (strcmp(val, "disabled") == 0)        g_root_access = ROOT_ACCESS_DISABLED;
+			else if (strcmp(val, "adb-only") == 0)   g_root_access = ROOT_ACCESS_ADB_ONLY;
+			else if (strcmp(val, "apps-only") == 0)  g_root_access = ROOT_ACCESS_APPS_ONLY;
+			else                                      g_root_access = ROOT_ACCESS_PROMPT;
+		} else if (sscanf(line, "multiuser %31s", val) == 1) {
+			if (strcmp(val, "owner-only") == 0)     g_multiuser = MULTIUSER_OWNER_ONLY;
+			else if (strcmp(val, "global") == 0)     g_multiuser = MULTIUSER_GLOBAL;
+			else                                     g_multiuser = MULTIUSER_OWNER_MANAGED;
+		}
+		(void)what;
+	}
+	fclose(f);
+}
+
+static enum su_policy policy_lookup(long uid, bool *found)
+{
+	*found = false;
+	policy_load_globals();
+	FILE *f = fopen(policy_file_path(), "r");
+	if (f == NULL)
+		return SU_POLICY_QUERY;
+	char line[128];
+	enum su_policy result = SU_POLICY_QUERY;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		/* skip the global setting lines */
+		if (strncmp(line, "root-access", 11) == 0
+		    || strncmp(line, "multiuser", 10) == 0)
+			continue;
+		long u;
+		char what[32];
+		if (sscanf(line, "%ld %31s", &u, what) != 2)
+			continue;
+		if (u != uid)
+			continue;
+		*found = true;
+		if (strcmp(what, "allow") == 0)         result = SU_POLICY_ALLOW;
+		else if (strcmp(what, "deny") == 0)     result = SU_POLICY_DENY;
+		else if (strcmp(what, "restrict") == 0) result = SU_POLICY_RESTRICT;
+		else                                   result = SU_POLICY_QUERY;
+		break;
+	}
+	fclose(f);
+	return result;
+}
+
+static void policy_store(long uid, enum su_policy p)
+{
+	const char *what = "query";
+	switch (p) {
+	case SU_POLICY_ALLOW:    what = "allow";    break;
+	case SU_POLICY_DENY:     what = "deny";     break;
+	case SU_POLICY_RESTRICT: what = "restrict"; break;
+	case SU_POLICY_QUERY:    what = "query";    break;
+	}
+	/* rewrite the single line for this uid, then append if absent */
+	FILE *f = fopen(policy_file_path(), "r");
+	if (f) {
+		char tmp[PATH_MAX];
+		snprintf(tmp, sizeof(tmp), "%s.tmp", policy_file_path());
+		FILE *o = fopen(tmp, "w");
+		if (o) {
+			char line[128];
+			int written = 0;
+			while (fgets(line, sizeof(line), f) != NULL) {
+				/* keep the global setting lines */
+				if (strncmp(line, "root-access", 11) == 0
+				    || strncmp(line, "multiuser", 10) == 0) {
+					fputs(line, o);
+					continue;
+				}
+				long u;
+				if (sscanf(line, "%ld", &u) == 1 && u == uid)
+					continue;	/* replaced below */
+				fputs(line, o);
+			}
+			fprintf(o, "%ld %s\n", uid, what);
+			written = 1;
+			fclose(o);
+			if (written) {
+				rename(tmp, policy_file_path());
+				fclose(f);
+				return;
+			}
+			unlink(tmp);
+		}
+		fclose(f);
+	}
+	FILE *a = fopen(policy_file_path(), "a");
+	if (a) {
+		fprintf(a, "%ld %s\n", uid, what);
+		fclose(a);
+	}
+}
+
+/* Android user id = uid / 100000. */
+static long to_user_id(long uid) { return uid / 100000; }
+/* App id = uid % 100000. */
+static long to_app_id(long uid) { return uid % 100000; }
+
+#define AID_ROOT 0L
+#define AID_SHELL 2000L
+
+/*
+ * Decide whether this caller may have root, following Magisk's
+ * build_su_info() order: root is always allowed, the manager is allowed
+ * silently, the global RootAccess mode is enforced, multiuser OwnerOnly
+ * confines root to the device owner, and only then does the per-uid policy
+ * table decide.  A caller with no stored decision lands on QUERY, which
+ * Magisk resolves by asking its manager app; with no manager to ask it
+ * denies, and so do we.
+ */
+static void apply_root_policy(void)
+{
+	if (g_caller_uid < 0)
+		return;
+	if (g_caller_uid == AID_ROOT) {
+		/* uid 0 asking for root is root already. */
+		return;
+	}
+	if (g_root_access == ROOT_ACCESS_DISABLED) {
+		fprintf(stderr, "su: root access is disabled\n");
+		exit(1);
+	}
+	if (g_root_access == ROOT_ACCESS_ADB_ONLY && g_caller_uid != AID_SHELL) {
+		fprintf(stderr, "su: root access limited to ADB only\n");
+		exit(1);
+	}
+	if (g_root_access == ROOT_ACCESS_APPS_ONLY && g_caller_uid == AID_SHELL) {
+		fprintf(stderr, "su: root access is disabled for ADB\n");
+		exit(1);
+	}
+	if (g_multiuser == MULTIUSER_OWNER_ONLY && to_user_id(g_caller_uid) != 0) {
+		fprintf(stderr, "su: root access is limited to the device owner "
+			"(user %ld)\n", to_user_id(g_caller_uid));
+		exit(1);
+	}
+
+	bool found = false;
+	enum su_policy pol = policy_lookup(g_caller_uid, &found);
+	if (pol == SU_POLICY_DENY) {
+		fprintf(stderr, "su: request rejected for uid %ld\n", g_caller_uid);
+		exit(1);
+	}
+	if (pol == SU_POLICY_RESTRICT) {
+		/* Magisk forces drop_cap for a restricted policy. */
+		g_drop_cap = true;
+	}
+	if (pol == SU_POLICY_QUERY) {
+		/* No decision stored.  Magisk would prompt its manager here;
+		 * without one there is nobody to ask, and Magisk's own code
+		 * path treats a missing manager as deny.  Termux is granted
+		 * root explicitly below so the package is usable out of the
+		 * box on a device that never ran a manager. */
+		if (to_app_id(g_caller_uid) == to_app_id((long)getuid())) {
+			pol = SU_POLICY_ALLOW;
+		} else {
+			fprintf(stderr, "su: uid %ld has no root policy; deny\n",
+				g_caller_uid);
+			exit(1);
+		}
+	}
+	(void)to_app_id;
+}
+
 static void gen_fake_status(void)
 {
 	/* Fuse: transplant of thj_ptrace's build_fake_status().  Snapshot the
@@ -1557,20 +1790,20 @@ static void gen_fake_status(void)
 		} else if (strncmp(line, "CapInh:", 7) == 0)
 			repl = "CapInh:\t0000000000000000\n";
 		else if (strncmp(line, "CapPrm:", 7) == 0)
-			repl = g_uid == 0
+			repl = g_uid == 0 && !g_drop_cap
 				? "CapPrm:\t000001ffffffffff\n"
 				: "CapPrm:\t0000000000000000\n";
 		else if (strncmp(line, "CapEff:", 7) == 0)
-			repl = g_uid == 0
+			repl = g_uid == 0 && !g_drop_cap
 				? "CapEff:\t000001ffffffffff\n"
 				: "CapEff:\t0000000000000000\n";
 		else if (strncmp(line, "CapBnd:", 7) == 0)
-			repl = g_uid == 0
+			repl = g_uid == 0 && !g_drop_cap
 				? "CapBnd:\t000001ffffffffff\n"
 				: "CapBnd:\t0000000000000000\n";
 		else if (strncmp(line, "CapAmb:", 7) == 0)
-			repl = g_uid == 0
-				? "CapAmb:\t0000000000000000\n"
+			repl = g_uid == 0 && !g_drop_cap
+				? "CapAmb:\t000001ffffffffff\n"
 				: "CapAmb:\t0000000000000000\n";
 		const char *use = repl ? repl : line;
 		size_t l = strlen(use);
@@ -1808,7 +2041,7 @@ static void cleanup_workdir(void)
 	 * dot-prefixed cache files stay invisible to a plain `ls` anyway. */
 	if (g_work_dir[0] == '\0')
 		return;
-	static const char *keep[] = { ".usermap", ".ugroups", ".xattrs",
+	static const char *keep[] = { ".usermap", ".ugroups", ".xattrs", ".policy",
 				      ".props", ".propsmod", NULL };
 	DIR *d = opendir(g_work_dir);
 	if (!d)
@@ -2105,6 +2338,45 @@ static void build_and_run_proot(void)
 	}
 	for (int i = 0; i < id_arg_cnt; i++)
 		argv[argc++] = id_arg[i];
+	if (force_pty) {
+		/* -i: the real su hands the session a pseudo-terminal even when
+		 * -c is used.  proot cannot allocate one itself, so route the
+		 * shell through util-linux `script`, which already does.  Look
+		 * for it in the places a Termux install actually has it rather
+		 * than assuming a path: /system/bin/script does not exist on
+		 * every device (this one has no toybox script applet).  If no
+		 * `script` is available we cannot honour -i, and saying so beats
+		 * pretending the session got a tty. */
+		static const char *pty_candidates[] = {
+			"/data/data/com.termux/files/usr/bin/script",
+			"/system/bin/script",
+			"/bin/script",
+			NULL
+		};
+		const char *script_bin = NULL;
+		for (int i = 0; pty_candidates[i] != NULL; i++) {
+			if (access(pty_candidates[i], X_OK) == 0) {
+				script_bin = pty_candidates[i];
+				break;
+			}
+		}
+		if (script_bin == NULL) {
+			fprintf(stderr, "su: -i needs a `script' utility to allocate a "
+				"pty and none was found; install util-linux "
+				"(pkg install util-linux)\n");
+		} else {
+			argv[argc++] = "/system/bin/sh";
+			argv[argc++] = "-c";
+			char ptyline[PATH_MAX * 2];
+			snprintf(ptyline, sizeof(ptyline),
+				"exec %s -qfc %s /dev/null",
+				script_bin, shell);
+			argv[argc++] = ptyline;
+			argv[argc] = NULL;
+			proot_quiet = true;
+			exit(proot_main(argc, (char *const *)argv));
+		}
+	}
 	argv[argc++] = shell;
 	if (enoexec_case)
 		argv[argc++] = shell_argv0;
@@ -2311,6 +2583,10 @@ static void parse_options(int argc, char **argv)
 					exit(0);
 				} else if (strcmp(name, "login") == 0)
 					g_login = true;
+				else if (strcmp(name, "interactive") == 0)
+					g_interactive = true;
+				else if (strcmp(name, "drop-cap") == 0)
+					g_drop_cap = true;
 				else if (strcmp(name, "preserve-environment") == 0)
 					g_preserve = true;
 				else if (strcmp(name, "version") == 0) {
@@ -2327,6 +2603,14 @@ static void parse_options(int argc, char **argv)
 			continue; 
 		if (a[0] == '-' && a[1] != '\0') {
 			const char *cluster = a + 1;
+			/* Magisk keeps two legacy spellings working: -cn and -z are
+			 * both rewritten to -Z before getopt_long ever sees them. */
+			if (strcmp(cluster, "cn") == 0 || strcmp(cluster, "z") == 0) {
+				if (i >= argc)
+					usage_err("su: option requires an argument -- Z");
+				g_selinux_ctx = selinux_ctx_norm_validate(argv[i++]);
+				continue;
+			}
 			if (strcmp(cluster, "mm") == 0) {
 				g_mount = true;
 				continue;
@@ -2385,6 +2669,12 @@ static void parse_options(int argc, char **argv)
 					exit(0);
 				case 'l':
 					g_login = true;
+					break;
+				case 'i':
+					g_interactive = true;
+					break;
+				case 'd':
+					g_drop_cap = true;
 					break;
 				case 'm':
 				case 'p':
@@ -2466,6 +2756,93 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	aid_real_patch();
+
+	/* Policy administration, handled before option parsing so it never
+	 * starts a session:
+	 *   su --policy-list
+	 *   su --policy-set UID allow|deny|restrict|query
+	 *   su --policy-remove UID
+	 *   su --root-access prompt|disabled|adb-only|apps-only
+	 *   su --multiuser owner-managed|owner-only|global
+	 * A fake root that hands root to every caller would be trivially
+	 * distinguishable and would not behave like the real thing, so the
+	 * per-uid table is part of the normal interface. */
+	if (argc >= 2 && strcmp(argv[1], "--policy-list") == 0) {
+		FILE *f = fopen(policy_file_path(), "r");
+		if (f == NULL) {
+			printf("no stored policies\n");
+			return 0;
+		}
+		char line[128];
+		while (fgets(line, sizeof(line), f) != NULL)
+			fputs(line, stdout);
+		fclose(f);
+		return 0;
+	}
+	if (argc >= 4 && strcmp(argv[1], "--policy-set") == 0) {
+		long uid;
+		if (!valid_uint_str(argv[2], &uid)) {
+			fprintf(stderr, "su: invalid uid `%s'\n", argv[2]);
+			return 1;
+		}
+		enum su_policy p;
+		if (strcmp(argv[3], "allow") == 0)         p = SU_POLICY_ALLOW;
+		else if (strcmp(argv[3], "deny") == 0)     p = SU_POLICY_DENY;
+		else if (strcmp(argv[3], "restrict") == 0) p = SU_POLICY_RESTRICT;
+		else if (strcmp(argv[3], "query") == 0)    p = SU_POLICY_QUERY;
+		else {
+			fprintf(stderr, "su: policy must be one of "
+				"allow, deny, restrict, query\n");
+			return 1;
+		}
+		policy_store(uid, p);
+		printf("uid %ld -> %s\n", uid, argv[3]);
+		return 0;
+	}
+	if (argc >= 3 && strcmp(argv[1], "--policy-remove") == 0) {
+		long uid;
+		if (!valid_uint_str(argv[2], &uid)) {
+			fprintf(stderr, "su: invalid uid `%s'\n", argv[2]);
+			return 1;
+		}
+		policy_store(uid, SU_POLICY_QUERY);
+		printf("uid %ld -> query\n", uid);
+		return 0;
+	}
+	if (argc >= 3 && strcmp(argv[1], "--root-access") == 0) {
+		const char *m = argv[2];
+		enum root_access r;
+		if (strcmp(m, "prompt") == 0)        r = ROOT_ACCESS_PROMPT;
+		else if (strcmp(m, "disabled") == 0) r = ROOT_ACCESS_DISABLED;
+		else if (strcmp(m, "adb-only") == 0) r = ROOT_ACCESS_ADB_ONLY;
+		else if (strcmp(m, "apps-only") == 0) r = ROOT_ACCESS_APPS_ONLY;
+		else {
+			fprintf(stderr, "su: root-access must be one of "
+				"prompt, disabled, adb-only, apps-only\n");
+			return 1;
+		}
+		FILE *f = fopen(policy_file_path(), "a");
+		if (f) { fprintf(f, "root-access %s\n", m); fclose(f); }
+		printf("root-access -> %s\n", m);
+		return 0;
+	}
+	if (argc >= 3 && strcmp(argv[1], "--multiuser") == 0) {
+		const char *m = argv[2];
+		if (strcmp(m, "owner-managed") != 0 && strcmp(m, "owner-only") != 0
+		    && strcmp(m, "global") != 0) {
+			fprintf(stderr, "su: multiuser must be one of "
+				"owner-managed, owner-only, global\n");
+			return 1;
+		}
+		FILE *f = fopen(policy_file_path(), "a");
+		if (f) { fprintf(f, "multiuser %s\n", m); fclose(f); }
+		printf("multiuser -> %s\n", m);
+		return 0;
+	}
+
+	/* The caller is the process that invoked su. */
+	g_caller_uid = (long)getuid();
+
 	parse_options(argc, argv);
 	long v;
 	if (g_grp != NULL && !valid_uint_str(g_grp, &v))
@@ -2557,10 +2934,29 @@ int main(int argc, char **argv)
 	}
 	gen_fake_status();
 	gen_fake_cmdline();
-	if (g_tgt != NULL)
-		fprintf(stderr, "su: taking mount namespace of PID %s\n", g_tgt);
+	if (g_tgt != NULL) {
+		/* -t asks for the mount namespace of another process.  Real su
+		 * does that with setns(), which needs privileges we do not have:
+		 * fakesu runs unprivileged under proot, so a real namespace switch
+		 * is impossible.  Say so instead of printing a success line that
+		 * does not happen, and keep running in our own namespace. */
+		fprintf(stderr, "su: cannot enter the mount namespace of PID %s: "
+			"setns() requires privileges a fake root does not have; "
+			"continuing in the current namespace\n", g_tgt);
+	}
 	if (g_mount)
 		fprintf(stderr, "su: entering global mount namespace\n");
+	if (g_drop_cap)
+		fprintf(stderr, "su: dropping all capabilities\n");
+	if (g_interactive)
+		force_pty = true;
+	/* The caller is whoever invoked this su, not the uid being switched
+	 * to.  Enforce its policy before anything is staged for the session. */
+	apply_root_policy();
+	/* RESTRICT can turn drop_cap on, so the status file has to be built
+	 * after the policy ran, not before. */
+	gen_fake_status();
+	gen_fake_cmdline();
 	build_and_run_proot();
 	return 0;
 }
