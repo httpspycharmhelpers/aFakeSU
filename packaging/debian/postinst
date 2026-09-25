@@ -1,0 +1,11 @@
+#!/data/data/com.termux/files/usr/bin/sh
+B=/data/data/com.termux/files/usr/bin
+# Move termux-tools' su and sudo (if present) aside so dpkg can install ours
+# without a file conflict, and without removing those packages.
+for f in su sudo; do
+	[ -e "$B/$f" ] || [ -L "$B/$f" ] || continue
+	dpkg-divert --quiet --divert --rename --add "$B/$f" 2>/dev/null || true
+done
+chmod 755 "$B/su" "$B/sudo" "$B/fakesu" "$B/fakesu.elf" "$B/afake-su" \
+	"$B/rish" "$B/rishq" 2>/dev/null
+exit 0

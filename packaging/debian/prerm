@@ -1,0 +1,4 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Diverts are undone in postrm, on both remove and purge, so a purge
+# restores termux-tools' su and the stock sudo.
+exit 0

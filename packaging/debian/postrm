@@ -1,0 +1,15 @@
+#!/data/data/com.termux/files/usr/bin/sh
+B=/data/data/com.termux/files/usr/bin
+PKG=afake-su
+# The diversions are undone in postrm, on both remove and purge, so removing
+# afake-su brings back termux-tools' su and the stock sudo untouched.
+# --package and --divert must match preinst exactly.
+case "$1" in
+remove|purge)
+	for f in su sudo; do
+		dpkg-divert --quiet --package "$PKG" \
+			--divert "$B/$f.distrib" --rename --remove "$B/$f" 2>/dev/null || true
+	done
+	;;
+esac
+exit 0

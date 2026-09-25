@@ -1,0 +1,19 @@
+#!/data/data/com.termux/files/usr/bin/sh
+B=/data/data/com.termux/files/usr/bin
+PKG=afake-su
+# termux-tools ships $PREFIX/bin/su and is marked Essential, and sudo ships
+# $PREFIX/bin/sudo.  dpkg refuses to unpack over either.  Divert them instead
+# of declaring Conflicts/Replaces: that would uninstall those packages, while
+# a divert merely renames the original aside and restores it on removal.
+#
+# dpkg runs preinst before unpacking, which is the only moment diverting
+# still helps: the conflict is raised by the unpack itself.
+#
+# Note --divert takes a value.  Omitting it makes it swallow --rename as the
+# diverted-to name and the whole thing fails with "filename --rename is not
+# absolute".
+for f in su sudo; do
+	dpkg-divert --quiet --package "$PKG" \
+		--divert "$B/$f.distrib" --rename --add "$B/$f" 2>/dev/null || true
+done
+exit 0
