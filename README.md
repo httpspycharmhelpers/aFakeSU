@@ -55,4 +55,3 @@ cd ../../ && bash build_su.sh
 
 - Android 7+ 沙箱环境 + Termux(shim 与 ELF 都必须在 termux 用户目录内执行)
 - Shizuku/Rish 用于提 shell 权限(降级模式则以当前用户运行)
-- 仅娱乐,别拿去做坏事
